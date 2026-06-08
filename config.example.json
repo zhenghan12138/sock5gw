@@ -1,0 +1,41 @@
+{
+  "db_path": "/var/lib/sock5gw/sock5gw.db",
+  "lease_ttl": "24h",
+  "api": {
+    "listen": "0.0.0.0:8080",
+    "client_key": "change-client-token",
+    "admin_key": "change-admin-token",
+    "trust_proxy_headers": false
+  },
+  "gateway": {
+    "listen": "0.0.0.0:15001",
+    "transparent_proxy": true,
+    "blocked_ports": ["53", "853"],
+    "dial_timeout": "10s",
+    "idle_timeout": "2m"
+  },
+  "dns": {
+    "listen": "0.0.0.0:5353",
+    "fake_ip_cidr": "198.18.0.0/15",
+    "upstream": "1.1.1.1:53",
+    "blocked_qtypes": ["AAAA", "HTTPS", "SVCB"]
+  },
+  "health_check": {
+    "enabled": true,
+    "interval": "30s",
+    "timeout": "5s",
+    "target_host": "example.com",
+    "target_port": 80,
+    "exit_ip_url": "http://api.ipify.org/",
+    "failure_threshold": 3,
+    "success_threshold": 2
+  },
+  "proxies": [
+    {
+      "id": "proxy-001",
+      "address": "203.0.113.10:1080",
+      "username": "",
+      "password": ""
+    }
+  ]
+}

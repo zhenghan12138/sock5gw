@@ -1,0 +1,15 @@
+[Unit]
+Description=SOCKS5 allocation gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/sock5gw -config /etc/sock5gw/config.json
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,179 @@
+package config
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"time"
+)
+
+type Config struct {
+	DBPath      string        `json:"db_path"`
+	LeaseTTL    Duration      `json:"lease_ttl"`
+	HealthCheck HealthCheck   `json:"health_check"`
+	API         API           `json:"api"`
+	Gateway     Gateway       `json:"gateway"`
+	DNS         DNS           `json:"dns"`
+	Proxies     []ProxyConfig `json:"proxies"`
+}
+
+type API struct {
+	Listen     string `json:"listen"`
+	ClientKey  string `json:"client_key"`
+	AdminKey   string `json:"admin_key"`
+	TrustProxy bool   `json:"trust_proxy_headers"`
+}
+
+type Gateway struct {
+	Listen           string   `json:"listen"`
+	TransparentProxy bool     `json:"transparent_proxy"`
+	BlockedPorts     []string `json:"blocked_ports"`
+	DialTimeout      Duration `json:"dial_timeout"`
+	IdleTimeout      Duration `json:"idle_timeout"`
+}
+
+type DNS struct {
+	Listen      string   `json:"listen"`
+	FakeIPCIDR  string   `json:"fake_ip_cidr"`
+	Upstream    string   `json:"upstream"`
+	BlockedQTyp []string `json:"blocked_qtypes"`
+}
+
+type HealthCheck struct {
+	Enabled          bool     `json:"enabled"`
+	Interval         Duration `json:"interval"`
+	Timeout          Duration `json:"timeout"`
+	TargetHost       string   `json:"target_host"`
+	TargetPort       int      `json:"target_port"`
+	ExitIPURL        string   `json:"exit_ip_url"`
+	FailureThreshold int      `json:"failure_threshold"`
+	SuccessThreshold int      `json:"success_threshold"`
+}
+
+type ProxyConfig struct {
+	ID       string `json:"id"`
+	Address  string `json:"address"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
+type Duration struct {
+	time.Duration
+}
+
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	cfg.setDefaults()
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func (d *Duration) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		v, err := time.ParseDuration(s)
+		if err != nil {
+			return err
+		}
+		d.Duration = v
+		return nil
+	}
+	var n int64
+	if err := json.Unmarshal(data, &n); err != nil {
+		return err
+	}
+	d.Duration = time.Duration(n) * time.Second
+	return nil
+}
+
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.String())
+}
+
+func (cfg *Config) setDefaults() {
+	if cfg.DBPath == "" {
+		cfg.DBPath = "sock5gw.db"
+	}
+	if cfg.LeaseTTL.Duration == 0 {
+		cfg.LeaseTTL.Duration = 24 * time.Hour
+	}
+	if cfg.API.Listen == "" {
+		cfg.API.Listen = "127.0.0.1:8080"
+	}
+	if cfg.Gateway.Listen == "" {
+		cfg.Gateway.Listen = "0.0.0.0:15001"
+	}
+	if cfg.Gateway.DialTimeout.Duration == 0 {
+		cfg.Gateway.DialTimeout.Duration = 10 * time.Second
+	}
+	if cfg.Gateway.IdleTimeout.Duration == 0 {
+		cfg.Gateway.IdleTimeout.Duration = 2 * time.Minute
+	}
+	if cfg.DNS.Listen == "" {
+		cfg.DNS.Listen = "0.0.0.0:5353"
+	}
+	if cfg.DNS.FakeIPCIDR == "" {
+		cfg.DNS.FakeIPCIDR = "198.18.0.0/15"
+	}
+	if cfg.DNS.Upstream == "" {
+		cfg.DNS.Upstream = "1.1.1.1:53"
+	}
+	if cfg.HealthCheck.Interval.Duration == 0 {
+		cfg.HealthCheck.Interval.Duration = 30 * time.Second
+	}
+	if cfg.HealthCheck.Timeout.Duration == 0 {
+		cfg.HealthCheck.Timeout.Duration = 5 * time.Second
+	}
+	if cfg.HealthCheck.TargetHost == "" {
+		cfg.HealthCheck.TargetHost = "example.com"
+	}
+	if cfg.HealthCheck.TargetPort == 0 {
+		cfg.HealthCheck.TargetPort = 80
+	}
+	if cfg.HealthCheck.ExitIPURL == "" {
+		cfg.HealthCheck.ExitIPURL = "http://api.ipify.org/"
+	}
+	if cfg.HealthCheck.FailureThreshold == 0 {
+		cfg.HealthCheck.FailureThreshold = 3
+	}
+	if cfg.HealthCheck.SuccessThreshold == 0 {
+		cfg.HealthCheck.SuccessThreshold = 2
+	}
+}
+
+func (cfg *Config) validate() error {
+	if cfg.API.ClientKey == "" {
+		return errors.New("api.client_key is required")
+	}
+	if cfg.API.AdminKey == "" {
+		return errors.New("api.admin_key is required")
+	}
+	if _, _, err := net.ParseCIDR(cfg.DNS.FakeIPCIDR); err != nil {
+		return fmt.Errorf("dns.fake_ip_cidr: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, p := range cfg.Proxies {
+		if p.ID == "" {
+			return errors.New("proxy id is required")
+		}
+		if seen[p.ID] {
+			return fmt.Errorf("duplicate proxy id %q", p.ID)
+		}
+		seen[p.ID] = true
+		if _, _, err := net.SplitHostPort(p.Address); err != nil {
+			return fmt.Errorf("proxy %s address: %w", p.ID, err)
+		}
+	}
+	return nil
+}

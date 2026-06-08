@@ -1,0 +1,28 @@
+#!/usr/sbin/nft -f
+
+flush table inet sock5gw
+
+table inet sock5gw {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+
+    # Replace 192.168.1.0/24 with the client LAN range.
+    ip saddr 192.168.1.0/24 udp dport 53 redirect to :5353
+    ip saddr 192.168.1.0/24 tcp dport 53 redirect to :5353
+
+    # Do not capture local/private destinations or the gateway management ports.
+    ip saddr 192.168.1.0/24 ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return
+    ip saddr 192.168.1.0/24 tcp dport { 8080, 15001, 5353 } return
+
+    # Redirect client TCP traffic to the transparent gateway listener.
+    ip saddr 192.168.1.0/24 meta l4proto tcp redirect to :15001
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+
+    # Prevent bypass. The gateway service creates outbound connections locally;
+    # forwarded client traffic should not be routed directly.
+    ip saddr 192.168.1.0/24 drop
+  }
+}
