@@ -207,3 +207,52 @@ func TestAdminLeaseRequiresIPv4AndAssignsProxy(t *testing.T) {
 		t.Fatalf("assignment = %+v", assignment)
 	}
 }
+
+func TestImportProxyPayloadKookeeyJSON(t *testing.T) {
+	m := testManager(t, 0)
+	payload := []byte(`{"success":true,"data":[{"username":"u","password":"p","ip":"mobile.kookeey.info","port":1086}]}`)
+	result := m.ImportProxyPayload(context.Background(), payload)
+	if result.Imported != 1 || result.Skipped != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	status := m.Status()
+	proxies := status["proxies"].([]Proxy)
+	if len(proxies) != 1 {
+		t.Fatalf("proxies = %+v", proxies)
+	}
+	if proxies[0].Address != "mobile.kookeey.info:1086" {
+		t.Fatalf("address = %q", proxies[0].Address)
+	}
+}
+
+func TestBatchDisableAndDelete(t *testing.T) {
+	m := testManager(t, 2)
+	disabled := m.SetProxiesDisabled(context.Background(), []string{"a", "b"}, true)
+	if disabled.Updated != 2 || disabled.Skipped != 0 {
+		t.Fatalf("disabled = %+v", disabled)
+	}
+	if m.proxies["a"].Status != ProxyDisabled || m.proxies["b"].Status != ProxyDisabled {
+		t.Fatalf("statuses = %s %s", m.proxies["a"].Status, m.proxies["b"].Status)
+	}
+	deleted := m.DeleteProxies(context.Background(), []string{"a", "b"})
+	if deleted.Deleted != 2 || deleted.Skipped != 0 {
+		t.Fatalf("deleted = %+v", deleted)
+	}
+}
+
+func TestClearIdleProxiesSkipsActive(t *testing.T) {
+	m := testManager(t, 2)
+	lease := m.Lease("192.0.2.10")
+	if lease.ProxyID != "a" {
+		t.Fatalf("lease = %+v", lease)
+	}
+	result := m.ClearIdleProxies(context.Background())
+	if result.Deleted != 1 || result.Skipped != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	status := m.Status()
+	proxies := status["proxies"].([]Proxy)
+	if len(proxies) != 1 || proxies[0].ID != "a" {
+		t.Fatalf("proxies = %+v", proxies)
+	}
+}

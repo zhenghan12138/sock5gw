@@ -56,6 +56,11 @@ func (m *Manager) checkAll(ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
+				current, ok := m.proxyCheckSnapshot(p.ID)
+				if !ok {
+					continue
+				}
+				p = current
 				err := probeSOCKS(ctx, p, m.cfg.HealthCheck.TargetHost, m.cfg.HealthCheck.TargetPort, m.cfg.HealthCheck.Timeout.Duration)
 				exitIP := ""
 				if err == nil {

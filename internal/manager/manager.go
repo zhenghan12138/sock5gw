@@ -4,11 +4,15 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -88,6 +92,13 @@ type ImportResult struct {
 	Imported int      `json:"imported"`
 	Skipped  int      `json:"skipped"`
 	Errors   []string `json:"errors,omitempty"`
+}
+
+type BatchResult struct {
+	Updated int      `json:"updated"`
+	Deleted int      `json:"deleted"`
+	Skipped int      `json:"skipped"`
+	Errors  []string `json:"errors,omitempty"`
 }
 
 type Manager struct {
@@ -369,6 +380,218 @@ func (m *Manager) ImportProxies(ctx context.Context, text string) ImportResult {
 		result.Errors = append(result.Errors, err.Error())
 	}
 	return result
+}
+
+func (m *Manager) ImportProxiesFromURL(ctx context.Context, rawURL string) ImportResult {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ImportResult{Skipped: 1, Errors: []string{"url is required"}}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return ImportResult{Skipped: 1, Errors: []string{err.Error()}}
+	}
+	client := subscriptionHTTPClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		return ImportResult{Skipped: 1, Errors: []string{err.Error()}}
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+	if err != nil {
+		return ImportResult{Skipped: 1, Errors: []string{err.Error()}}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ImportResult{Skipped: 1, Errors: []string{fmt.Sprintf("subscription returned HTTP %d", resp.StatusCode)}}
+	}
+	return m.ImportProxyPayload(ctx, body)
+}
+
+func subscriptionHTTPClient() *http.Client {
+	dialer := &net.Dialer{
+		Timeout: 15 * time.Second,
+	}
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(address)
+				if err != nil || net.ParseIP(host) != nil {
+					return dialer.DialContext(ctx, network, address)
+				}
+				ips, err := resolveAOverDoH(ctx, host)
+				if err != nil {
+					return nil, err
+				}
+				var lastErr error
+				for _, ip := range ips {
+					conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+					if err == nil {
+						return conn, nil
+					}
+					lastErr = err
+				}
+				return nil, lastErr
+			},
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 20 * time.Second,
+			IdleConnTimeout:       30 * time.Second,
+		},
+	}
+}
+
+func resolveAOverDoH(ctx context.Context, host string) ([]net.IP, error) {
+	endpoint := "https://cloudflare-dns.com/dns-query?name=" + url.QueryEscape(host) + "&type=A"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/dns-json")
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				dialer := net.Dialer{Timeout: 5 * time.Second}
+				return dialer.DialContext(ctx, network, "1.1.1.1:443")
+			},
+			TLSClientConfig:       &tls.Config{ServerName: "cloudflare-dns.com", MinVersion: tls.VersionTLS12},
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Second,
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("doh returned HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		Answer []struct {
+			Type int    `json:"type"`
+			Data string `json:"data"`
+		} `json:"Answer"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	for _, answer := range payload.Answer {
+		if answer.Type != 1 {
+			continue
+		}
+		if ip := net.ParseIP(answer.Data); ip != nil && ip.To4() != nil {
+			ips = append(ips, ip)
+		}
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no A records for %s", host)
+	}
+	return ips, nil
+}
+
+func (m *Manager) ImportProxyPayload(ctx context.Context, body []byte) ImportResult {
+	var payload struct {
+		Success bool `json:"success"`
+		Data    []struct {
+			IP       string `json:"ip"`
+			Host     string `json:"host"`
+			Port     any    `json:"port"`
+			Username string `json:"username"`
+			Password string `json:"password"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil && len(payload.Data) > 0 {
+		result := ImportResult{}
+		for i, item := range payload.Data {
+			host := strings.TrimSpace(item.IP)
+			if host == "" {
+				host = strings.TrimSpace(item.Host)
+			}
+			port := fmt.Sprint(item.Port)
+			if f, ok := item.Port.(float64); ok {
+				port = strconv.Itoa(int(f))
+			}
+			if host == "" || port == "" {
+				result.Skipped++
+				result.Errors = append(result.Errors, fmt.Sprintf("item %d: host and port are required", i+1))
+				continue
+			}
+			in := ProxyInput{
+				Address:  net.JoinHostPort(host, port),
+				Username: item.Username,
+				Password: item.Password,
+			}
+			in.ID = proxyID(in)
+			if _, err := m.AddProxy(ctx, in); err != nil {
+				if strings.Contains(err.Error(), "already exists") {
+					result.Skipped++
+					continue
+				}
+				result.Skipped++
+				result.Errors = append(result.Errors, fmt.Sprintf("item %d: %v", i+1, err))
+				continue
+			}
+			result.Imported++
+		}
+		return result
+	}
+	return m.ImportProxies(ctx, string(body))
+}
+
+func (m *Manager) SetProxiesDisabled(ctx context.Context, ids []string, disabled bool) BatchResult {
+	result := BatchResult{}
+	for _, id := range uniqueStrings(ids) {
+		if _, err := m.SetProxyDisabled(ctx, id, disabled); err != nil {
+			result.Skipped++
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", id, err))
+			continue
+		}
+		result.Updated++
+	}
+	return result
+}
+
+func (m *Manager) DeleteProxies(ctx context.Context, ids []string) BatchResult {
+	result := BatchResult{}
+	for _, id := range uniqueStrings(ids) {
+		if err := m.DeleteProxy(ctx, id); err != nil {
+			result.Skipped++
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", id, err))
+			continue
+		}
+		result.Deleted++
+	}
+	return result
+}
+
+func (m *Manager) ClearIdleProxies(ctx context.Context) BatchResult {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.proxyOrder))
+	for _, id := range m.proxyOrder {
+		p := m.proxies[id]
+		if p == nil {
+			continue
+		}
+		if p.Status == ProxyActive || p.Status == ProxyDraining || p.ActiveConns > 0 {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+	return m.DeleteProxies(ctx, ids)
+}
+
+func (m *Manager) proxyCheckSnapshot(id string) (Proxy, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p := m.proxies[id]
+	if p == nil || p.Disabled || p.Status == ProxyDisabled {
+		return Proxy{}, false
+	}
+	return *p, true
 }
 
 func (m *Manager) UpdateProxy(ctx context.Context, id string, in ProxyInput) (*Proxy, error) {
@@ -715,6 +938,20 @@ func parseProxyURL(raw string) (ProxyInput, error) {
 func proxyID(in ProxyInput) string {
 	sum := sha1.Sum([]byte(in.Address + "|" + in.Username + "|" + in.Password))
 	return "proxy-" + hex.EncodeToString(sum[:])[:12]
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 func (m *Manager) enqueueUniqueLocked(queue *[]string, clientIP string) {

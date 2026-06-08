@@ -104,6 +104,56 @@ func NewAPI(m *Manager, cfg config.API) http.Handler {
 		}
 		writeJSON(w, m.ImportProxies(r.Context(), text))
 	})
+	mux.HandleFunc("POST /v1/admin/proxies/import-url", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var in struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, m.ImportProxiesFromURL(r.Context(), in.URL))
+	})
+	mux.HandleFunc("POST /v1/admin/proxies/batch/disabled", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var in struct {
+			IDs      []string `json:"ids"`
+			Disabled bool     `json:"disabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, m.SetProxiesDisabled(r.Context(), in.IDs, in.Disabled))
+	})
+	mux.HandleFunc("POST /v1/admin/proxies/batch/delete", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var in struct {
+			IDs []string `json:"ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, m.DeleteProxies(r.Context(), in.IDs))
+	})
+	mux.HandleFunc("POST /v1/admin/proxies/clear", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		writeJSON(w, m.ClearIdleProxies(r.Context()))
+	})
 	mux.HandleFunc("PUT /v1/admin/proxies/{id}", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.AdminKey) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -234,8 +284,24 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     </section>
     <section>
       <div class="section-head"><h2>代理池</h2><span class="muted">出口 IP 由健康检查通过 SOCKS5 获取</span></div>
+      <div style="padding:12px 16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+        <button onclick="batchDisable(false)">批量启用</button>
+        <button onclick="batchDisable(true)">批量停用</button>
+        <button class="danger" onclick="batchDelete()">批量删除</button>
+        <button class="danger" onclick="clearIdleProxies()">清空未使用代理</button>
+        <span class="muted" id="selectedCount">已选 0</span>
+        <span style="flex:1"></span>
+        <label class="muted">每页
+          <select id="pageSize" onchange="setPageSize()">
+            <option>25</option><option selected>50</option><option>100</option><option>200</option>
+          </select>
+        </label>
+        <button onclick="prevPage()">上一页</button>
+        <span class="muted" id="pageInfo">1 / 1</span>
+        <button onclick="nextPage()">下一页</button>
+      </div>
       <table>
-        <thead><tr><th>ID</th><th>地址</th><th>状态</th><th>出口 IP</th><th>客户端</th><th>连接数</th><th>健康详情</th><th>操作</th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="checkPage" onchange="togglePageSelection(this.checked)"></th><th>ID</th><th>地址</th><th>状态</th><th>出口 IP</th><th>客户端</th><th>连接数</th><th>健康详情</th><th>操作</th></tr></thead>
         <tbody id="proxies"></tbody>
       </table>
       <form id="proxyForm">
@@ -249,13 +315,27 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         <textarea id="importText" placeholder="批量粘贴代理，每行一个。支持 socks5://host:port:user:pass、socks5://user:pass@host:port、host:port:user:pass"></textarea>
         <div><button class="primary" onclick="importProxies()">批量导入</button> <span id="importResult" class="muted"></span></div>
       </div>
+      <div style="padding:14px 16px; border-top:1px solid var(--line); display:grid; grid-template-columns:1fr auto; gap:8px;">
+        <input id="subscriptionURL" placeholder="订阅 API URL，例如 https://www.kookeey.net/pickdynamicips?...">
+        <button class="primary" onclick="importSubscription()">订阅导入</button>
+        <span id="subscriptionResult" class="muted"></span>
+      </div>
     </section>
   </main>
   <script>
     const token = () => document.getElementById('token').value;
     const auth = () => ({ 'Authorization': 'Bearer ' + token(), 'Content-Type': 'application/json' });
-    const pill = s => '<span class="pill '+ String(s || '').replaceAll('_','-') +'">'+ (s || '-') +'</span>';
+    let allProxies = [];
+    let selectedProxyIds = new Set();
+    let proxyPage = 1;
     const fmtTime = v => v ? new Date(v).toLocaleString() : '-';
+    function setText(el, text) { el.textContent = text == null || text === '' ? '-' : String(text); }
+    function appendPill(td, status) {
+      const span = document.createElement('span');
+      span.className = 'pill ' + String(status || '').replaceAll('_','-');
+      span.textContent = status || '-';
+      td.appendChild(span);
+    }
     async function api(path, opts = {}) {
       const res = await fetch(path, { ...opts, headers: { ...auth(), ...(opts.headers || {}) } });
       if (!res.ok) throw new Error(await res.text());
@@ -266,23 +346,99 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       const data = await api('/v1/admin/status');
       const clients = data.clients || [];
       const proxies = data.proxies || [];
+      allProxies = proxies;
       document.getElementById('clientCount').textContent = clients.length;
       document.getElementById('proxyCount').textContent = proxies.length;
       document.getElementById('idleCount').textContent = proxies.filter(p => p.status === 'idle').length;
       document.getElementById('connCount').textContent = proxies.reduce((n,p) => n + (p.active_connections || 0), 0);
       document.getElementById('queueCount').textContent = (data.pending_new || []).length + (data.pending_refresh || []).length;
-      document.getElementById('clients').innerHTML = clients.map(c => '<tr>'+
-        '<td>'+c.client_ip+'</td><td>'+pill(c.status)+'</td><td>'+(c.proxy_id || '-')+'<div class="muted">'+(c.proxy_address || '')+'</div></td>'+
-        '<td>'+(c.exit_ip || '-')+'</td><td>'+(c.active_connections || 0)+'</td><td>'+fmtTime(c.expires_at)+'</td>'+
-        '<td><button class="danger" onclick="releaseLease(\''+c.client_ip+'\')">释放</button></td></tr>').join('');
-      document.getElementById('proxies').innerHTML = proxies.map(p => '<tr>'+
-        '<td>'+p.id+'</td><td>'+p.address+'</td><td>'+pill(p.status)+'</td><td>'+(p.exit_ip || '-')+'</td>'+
-        '<td>'+(p.client_ip || p.draining_for || '-')+'</td><td>'+(p.active_connections || 0)+'</td><td class="muted">'+(p.last_health_detail || '-')+'</td>'+
-        '<td><button onclick="toggleProxy(\''+p.id+'\','+(!p.disabled)+',\''+p.address+'\',\''+(p.username || '')+'\')">'+(p.disabled ? '启用' : '停用')+'</button> '+
-        '<button class="danger" onclick="deleteProxy(\''+p.id+'\')">删除</button></td></tr>').join('');
+      const clientBody = document.getElementById('clients');
+      clientBody.replaceChildren();
+      clients.forEach(c => {
+        const tr = document.createElement('tr');
+        const ip = tr.insertCell(); setText(ip, c.client_ip);
+        const status = tr.insertCell(); appendPill(status, c.status);
+        const proxy = tr.insertCell(); setText(proxy, c.proxy_id);
+        const proxyAddr = document.createElement('div'); proxyAddr.className = 'muted'; proxyAddr.textContent = c.proxy_address || ''; proxy.appendChild(proxyAddr);
+        setText(tr.insertCell(), c.exit_ip);
+        setText(tr.insertCell(), c.active_connections || 0);
+        setText(tr.insertCell(), fmtTime(c.expires_at));
+        const actions = tr.insertCell();
+        const btn = document.createElement('button'); btn.className = 'danger'; btn.textContent = '释放'; btn.onclick = () => releaseLease(c.client_ip); actions.appendChild(btn);
+        clientBody.appendChild(tr);
+      });
+      renderProxyPage();
+    }
+    function currentPageSize() { return Number(document.getElementById('pageSize')?.value || 50); }
+    function pageCount() { return Math.max(1, Math.ceil(allProxies.length / currentPageSize())); }
+    function renderProxyPage() {
+      proxyPage = Math.min(Math.max(1, proxyPage), pageCount());
+      const size = currentPageSize();
+      const start = (proxyPage - 1) * size;
+      const pageItems = allProxies.slice(start, start + size);
+      document.getElementById('pageInfo').textContent = proxyPage + ' / ' + pageCount();
+      document.getElementById('selectedCount').textContent = '已选 ' + selectedProxyIds.size;
+      document.getElementById('checkPage').checked = pageItems.length > 0 && pageItems.every(p => selectedProxyIds.has(p.id));
+      const body = document.getElementById('proxies');
+      body.replaceChildren();
+      pageItems.forEach(p => {
+        const tr = document.createElement('tr');
+        const checked = tr.insertCell();
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = selectedProxyIds.has(p.id);
+        checkbox.onchange = () => toggleProxySelection(p.id, checkbox.checked);
+        checked.appendChild(checkbox);
+        setText(tr.insertCell(), p.id);
+        setText(tr.insertCell(), p.address);
+        appendPill(tr.insertCell(), p.status);
+        setText(tr.insertCell(), p.exit_ip);
+        setText(tr.insertCell(), p.client_ip || p.draining_for);
+        setText(tr.insertCell(), p.active_connections || 0);
+        const detail = tr.insertCell(); detail.className = 'muted'; setText(detail, p.last_health_detail);
+        const actions = tr.insertCell();
+        const toggle = document.createElement('button'); toggle.textContent = p.disabled ? '启用' : '停用'; toggle.onclick = () => toggleProxy(p.id, !p.disabled); actions.appendChild(toggle);
+        actions.appendChild(document.createTextNode(' '));
+        const del = document.createElement('button'); del.className = 'danger'; del.textContent = '删除'; del.onclick = () => deleteProxy(p.id); actions.appendChild(del);
+        body.appendChild(tr);
+      });
+    }
+    function setPageSize() { proxyPage = 1; renderProxyPage(); }
+    function prevPage() { proxyPage--; renderProxyPage(); }
+    function nextPage() { proxyPage++; renderProxyPage(); }
+    function toggleProxySelection(id, checked) {
+      if (checked) selectedProxyIds.add(id); else selectedProxyIds.delete(id);
+      renderProxyPage();
+    }
+    function togglePageSelection(checked) {
+      const size = currentPageSize();
+      const start = (proxyPage - 1) * size;
+      allProxies.slice(start, start + size).forEach(p => checked ? selectedProxyIds.add(p.id) : selectedProxyIds.delete(p.id));
+      renderProxyPage();
     }
     async function releaseLease(ip) { await api('/v1/admin/leases/' + encodeURIComponent(ip), { method:'DELETE' }); load(); }
     async function deleteProxy(id) { await api('/v1/admin/proxies/' + encodeURIComponent(id), { method:'DELETE' }); load(); }
+    async function batchDisable(disabled) {
+      const ids = Array.from(selectedProxyIds);
+      if (!ids.length) return alert('请先勾选代理');
+      await api('/v1/admin/proxies/batch/disabled', { method:'POST', body: JSON.stringify({ ids, disabled }) });
+      selectedProxyIds.clear();
+      load();
+    }
+    async function batchDelete() {
+      const ids = Array.from(selectedProxyIds);
+      if (!ids.length) return alert('请先勾选代理');
+      if (!confirm('确认删除选中的 '+ids.length+' 个未使用代理？使用中的代理会跳过。')) return;
+      await api('/v1/admin/proxies/batch/delete', { method:'POST', body: JSON.stringify({ ids }) });
+      selectedProxyIds.clear();
+      load();
+    }
+    async function clearIdleProxies() {
+      if (!confirm('确认清空所有未使用代理？正在绑定客户端或有连接的代理会跳过。')) return;
+      await api('/v1/admin/proxies/clear', { method:'POST', body:'{}' });
+      selectedProxyIds.clear();
+      load();
+    }
     async function toggleProxy(id, disabled) {
       await api('/v1/admin/proxies/' + encodeURIComponent(id) + '/disabled', { method:'POST', body: JSON.stringify({ disabled }) });
       load();
@@ -306,6 +462,12 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       const result = await api('/v1/admin/proxies/import', { method:'POST', body:text, headers:{'Content-Type':'text/plain'} });
       document.getElementById('importResult').textContent = '导入 '+result.imported+'，跳过 '+result.skipped+(result.errors?.length ? '，错误 '+result.errors.length : '');
       if (!result.errors?.length) document.getElementById('importText').value = '';
+      load();
+    }
+    async function importSubscription() {
+      const url = document.getElementById('subscriptionURL').value;
+      const result = await api('/v1/admin/proxies/import-url', { method:'POST', body: JSON.stringify({ url }) });
+      document.getElementById('subscriptionResult').textContent = '导入 '+result.imported+'，跳过 '+result.skipped+(result.errors?.length ? '，错误 '+result.errors.length : '');
       load();
     }
     load().catch(err => alert(err.message));

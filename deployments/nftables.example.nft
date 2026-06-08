@@ -5,6 +5,8 @@ table inet sock5gw {
     type nat hook prerouting priority dstnat; policy accept;
 
     # Replace 192.168.1.0/24 with the client LAN range.
+    # Replace 192.168.1.10 with the gateway host IP.
+    ip saddr 192.168.1.10 return
     ip saddr 192.168.1.0/24 udp dport 53 redirect to :5353
     ip saddr 192.168.1.0/24 tcp dport 53 redirect to :5353
 
