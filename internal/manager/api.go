@@ -244,7 +244,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     .pill { display:inline-flex; align-items:center; min-height:22px; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#1d4ed8; font-size:12px; }
     .idle { background:#ecfdf3; color:var(--good); }
     .active { background:#eff8ff; color:#175cd3; }
-    .draining,.pending { background:#fffaeb; color:var(--warn); }
+    .draining,.pending,.checking { background:#fffaeb; color:var(--warn); }
     .unhealthy,.blocked { background:#fef3f2; color:var(--bad); }
     .disabled { background:#f2f4f7; color:#475467; }
     form { display:grid; grid-template-columns:1fr 1.2fr 1fr 1fr auto; gap:8px; padding:14px 16px; border-top:1px solid var(--line); }
@@ -283,7 +283,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       </form>
     </section>
     <section>
-      <div class="section-head"><h2>代理池</h2><span class="muted">出口 IP 由健康检查通过 SOCKS5 获取</span></div>
+			<div class="section-head"><h2>代理池</h2><span class="muted">出口 IP 在分配客户端前通过 SOCKS5 检测获取</span></div>
       <div style="padding:12px 16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
         <button onclick="batchDisable(false)">批量启用</button>
         <button onclick="batchDisable(true)">批量停用</button>

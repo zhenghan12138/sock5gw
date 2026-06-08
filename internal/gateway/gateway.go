@@ -76,8 +76,7 @@ func (g *Gateway) handle(client net.Conn) {
 		slog.Debug("client has no usable lease", "client_ip", clientIP, "err", err)
 		return
 	}
-	dialer := net.Dialer{Timeout: g.cfg.DialTimeout.Duration}
-	upstream, err := dialer.Dial("tcp", proxy.Address)
+	upstream, err := manager.DialProxy(context.Background(), *proxy, g.cfg.DialTimeout.Duration)
 	if err != nil {
 		slog.Warn("proxy dial failed", "client_ip", clientIP, "proxy_id", proxy.ID, "err", err)
 		return

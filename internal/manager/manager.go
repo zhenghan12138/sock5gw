@@ -30,6 +30,7 @@ const (
 	LeaseBlocked = "blocked"
 
 	ProxyIdle      = "idle"
+	ProxyChecking  = "checking"
 	ProxyActive    = "active"
 	ProxyDraining  = "draining"
 	ProxyUnhealthy = "unhealthy"
@@ -37,6 +38,8 @@ const (
 )
 
 var ErrNoLease = errors.New("no active lease")
+
+type proxyProbeFunc func(context.Context, Proxy) (string, error)
 
 type Proxy struct {
 	ID               string `json:"id"`
@@ -113,6 +116,8 @@ type Manager struct {
 	pendingRefs []string
 	conns       map[string]map[net.Conn]struct{}
 	fake        *FakeIPStore
+	probeProxy  proxyProbeFunc
+	queueActive bool
 }
 
 func New(cfg *config.Config, db *store.DB) (*Manager, error) {
@@ -123,6 +128,7 @@ func New(cfg *config.Config, db *store.DB) (*Manager, error) {
 		leases:  map[string]*LeaseView{},
 		conns:   map[string]map[net.Conn]struct{}{},
 	}
+	m.probeProxy = m.defaultProbeProxy
 	fake, err := NewFakeIPStore(cfg.DNS.FakeIPCIDR)
 	if err != nil {
 		return nil, err
@@ -191,24 +197,18 @@ func (m *Manager) FakeIPStore() *FakeIPStore {
 }
 
 func (m *Manager) Lease(clientIP string) Assignment {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.ensureLeaseLocked(context.Background(), clientIP, false)
+	return m.ensureLease(context.Background(), clientIP, false)
 }
 
 func (m *Manager) AdminLease(clientIP string) (Assignment, error) {
 	if ip := net.ParseIP(clientIP); ip == nil || ip.To4() == nil {
 		return Assignment{}, errors.New("valid IPv4 client_ip is required")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.ensureLeaseLocked(context.Background(), clientIP, false), nil
+	return m.ensureLease(context.Background(), clientIP, false), nil
 }
 
 func (m *Manager) Refresh(clientIP string) Assignment {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.ensureLeaseLocked(context.Background(), clientIP, true)
+	return m.ensureLease(context.Background(), clientIP, true)
 }
 
 func (m *Manager) Current(clientIP string) Assignment {
@@ -256,7 +256,7 @@ func (m *Manager) RegisterConn(clientIP, proxyID string, conn net.Conn) {
 
 func (m *Manager) UnregisterConn(clientIP, proxyID string, conn net.Conn) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	wakeQueue := false
 	if set := m.conns[clientIP]; set != nil {
 		delete(set, conn)
 		if len(set) == 0 {
@@ -269,8 +269,12 @@ func (m *Manager) UnregisterConn(clientIP, proxyID string, conn net.Conn) {
 			p.Status = ProxyIdle
 			p.ClientIP = ""
 			p.DrainingFor = ""
-			m.assignQueuedLocked(context.Background())
+			wakeQueue = true
 		}
+	}
+	m.mu.Unlock()
+	if wakeQueue {
+		m.processQueueAsync()
 	}
 }
 
@@ -321,8 +325,8 @@ func (m *Manager) AddProxy(ctx context.Context, in ProxyInput) (*Proxy, error) {
 		return nil, fmt.Errorf("address: %w", err)
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if _, exists := m.proxies[in.ID]; exists {
+		m.mu.Unlock()
 		return nil, errors.New("proxy already exists")
 	}
 	status := ProxyIdle
@@ -338,13 +342,15 @@ func (m *Manager) AddProxy(ctx context.Context, in ProxyInput) (*Proxy, error) {
 		Disabled: in.Disabled,
 	}
 	if err := m.db.UpsertProxy(ctx, store.Proxy{ID: in.ID, Address: in.Address, Username: in.Username, Password: in.Password, Disabled: in.Disabled}); err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
 	m.proxies[p.ID] = p
 	m.proxyOrder = append(m.proxyOrder, p.ID)
 	sort.Strings(m.proxyOrder)
-	m.assignQueuedLocked(ctx)
 	cp := *p
+	m.mu.Unlock()
+	m.processQueueAsync()
 	return &cp, nil
 }
 
@@ -492,6 +498,33 @@ func resolveAOverDoH(ctx context.Context, host string) ([]net.IP, error) {
 	return ips, nil
 }
 
+func DialProxy(ctx context.Context, p Proxy, timeout time.Duration) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: timeout}
+	host, port, err := net.SplitHostPort(p.Address)
+	if err != nil {
+		return nil, err
+	}
+	if net.ParseIP(host) != nil {
+		return dialer.DialContext(ctx, "tcp", p.Address)
+	}
+	ips, err := resolveAOverDoH(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no usable A records for %s", host)
+}
+
 func (m *Manager) ImportProxyPayload(ctx context.Context, body []byte) ImportResult {
 	var payload struct {
 		Success bool `json:"success"`
@@ -575,7 +608,7 @@ func (m *Manager) ClearIdleProxies(ctx context.Context) BatchResult {
 		if p == nil {
 			continue
 		}
-		if p.Status == ProxyActive || p.Status == ProxyDraining || p.ActiveConns > 0 {
+		if p.Status == ProxyActive || p.Status == ProxyChecking || p.Status == ProxyDraining || p.ActiveConns > 0 {
 			continue
 		}
 		ids = append(ids, id)
@@ -588,7 +621,7 @@ func (m *Manager) proxyCheckSnapshot(id string) (Proxy, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p := m.proxies[id]
-	if p == nil || p.Disabled || p.Status == ProxyDisabled {
+	if p == nil || p.Disabled || p.Status == ProxyDisabled || p.Status == ProxyChecking {
 		return Proxy{}, false
 	}
 	return *p, true
@@ -599,9 +632,9 @@ func (m *Manager) UpdateProxy(ctx context.Context, id string, in ProxyInput) (*P
 		return nil, fmt.Errorf("address: %w", err)
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	p := m.proxies[id]
 	if p == nil {
+		m.mu.Unlock()
 		return nil, errors.New("proxy not found")
 	}
 	p.Address = in.Address
@@ -614,18 +647,20 @@ func (m *Manager) UpdateProxy(ctx context.Context, id string, in ProxyInput) (*P
 		p.Status = ProxyIdle
 	}
 	if err := m.db.UpsertProxy(ctx, store.Proxy{ID: id, Address: p.Address, Username: p.Username, Password: p.Password, Disabled: p.Disabled}); err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
-	m.assignQueuedLocked(ctx)
 	cp := *p
+	m.mu.Unlock()
+	m.processQueueAsync()
 	return &cp, nil
 }
 
 func (m *Manager) SetProxyDisabled(ctx context.Context, id string, disabled bool) (*Proxy, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	p := m.proxies[id]
 	if p == nil {
+		m.mu.Unlock()
 		return nil, errors.New("proxy not found")
 	}
 	p.Disabled = disabled
@@ -636,10 +671,12 @@ func (m *Manager) SetProxyDisabled(ctx context.Context, id string, disabled bool
 		p.Status = ProxyIdle
 	}
 	if err := m.db.UpsertProxy(ctx, store.Proxy{ID: p.ID, Address: p.Address, Username: p.Username, Password: p.Password, Disabled: p.Disabled}); err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
-	m.assignQueuedLocked(ctx)
 	cp := *p
+	m.mu.Unlock()
+	m.processQueueAsync()
 	return &cp, nil
 }
 
@@ -650,7 +687,7 @@ func (m *Manager) DeleteProxy(ctx context.Context, id string) error {
 	if p == nil {
 		return errors.New("proxy not found")
 	}
-	if p.Status == ProxyActive || p.Status == ProxyDraining || p.ActiveConns > 0 {
+	if p.Status == ProxyActive || p.Status == ProxyChecking || p.Status == ProxyDraining || p.ActiveConns > 0 {
 		return errors.New("proxy is in use")
 	}
 	if err := m.db.DeleteProxy(ctx, id); err != nil {
@@ -663,18 +700,52 @@ func (m *Manager) DeleteProxy(ctx context.Context, id string) error {
 
 func (m *Manager) Release(clientIP string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.releaseLocked(context.Background(), clientIP, true)
+	m.mu.Unlock()
+	m.processQueueAsync()
 }
 
-func (m *Manager) ensureLeaseLocked(ctx context.Context, clientIP string, refresh bool) Assignment {
+func (m *Manager) ensureLease(ctx context.Context, clientIP string, refresh bool) Assignment {
+	for {
+		proxy, pending := m.reserveProxyForLease(ctx, clientIP, refresh)
+		if proxy == nil {
+			return pending
+		}
+		exitIP, err := m.probeProxy(ctx, *proxy)
+		m.mu.Lock()
+		current := m.proxies[proxy.ID]
+		if current == nil || current.Status != ProxyChecking || current.ClientIP != clientIP {
+			m.mu.Unlock()
+			continue
+		}
+		if current.Disabled {
+			current.Status = ProxyDisabled
+			current.ClientIP = ""
+			current.DrainingFor = ""
+			m.mu.Unlock()
+			continue
+		}
+		if err != nil {
+			m.markProbeFailedLocked(ctx, current, err)
+			m.mu.Unlock()
+			continue
+		}
+		assignment := m.activateCheckedProxyLocked(ctx, current, clientIP, refresh, exitIP)
+		m.mu.Unlock()
+		return assignment
+	}
+}
+
+func (m *Manager) reserveProxyForLease(ctx context.Context, clientIP string, refresh bool) (*Proxy, Assignment) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	now := time.Now()
 	if l := m.leases[clientIP]; l != nil && l.Status == LeaseActive && now.After(l.ExpiresAt) {
 		m.releaseLocked(ctx, clientIP, true)
 	}
 	if !refresh {
 		if l := m.leases[clientIP]; l != nil && l.Status == LeaseActive {
-			return Assignment{ClientIP: clientIP, ProxyID: l.ProxyID, Status: LeaseActive, ExpiresAt: l.ExpiresAt}
+			return nil, Assignment{ClientIP: clientIP, ProxyID: l.ProxyID, Status: LeaseActive, ExpiresAt: l.ExpiresAt}
 		}
 	}
 	proxy := m.takeIdleProxyLocked()
@@ -682,14 +753,24 @@ func (m *Manager) ensureLeaseLocked(ctx context.Context, clientIP string, refres
 		if refresh {
 			m.enqueueUniqueLocked(&m.pendingRefs, clientIP)
 			if l := m.leases[clientIP]; l != nil && l.Status == LeaseActive {
-				return Assignment{ClientIP: clientIP, ProxyID: l.ProxyID, Status: LeasePending, ExpiresAt: l.ExpiresAt}
+				m.db.AddEvent(ctx, clientIP, "", "pending", fmt.Sprintf("refresh=%v", refresh))
+				return nil, Assignment{ClientIP: clientIP, ProxyID: l.ProxyID, Status: LeasePending, ExpiresAt: l.ExpiresAt}
 			}
 		} else {
 			m.enqueueUniqueLocked(&m.pendingNew, clientIP)
 		}
 		m.db.AddEvent(ctx, clientIP, "", "pending", fmt.Sprintf("refresh=%v", refresh))
-		return Assignment{ClientIP: clientIP, Status: LeasePending}
+		return nil, Assignment{ClientIP: clientIP, Status: LeasePending}
 	}
+	proxy.Status = ProxyChecking
+	proxy.ClientIP = clientIP
+	proxy.DrainingFor = ""
+	cp := *proxy
+	return &cp, Assignment{}
+}
+
+func (m *Manager) activateCheckedProxyLocked(ctx context.Context, proxy *Proxy, clientIP string, refresh bool, exitIP string) Assignment {
+	now := time.Now()
 	expires := now.Add(m.cfg.LeaseTTL.Duration)
 	if refresh {
 		if old := m.leases[clientIP]; old != nil && old.ProxyID != "" {
@@ -706,57 +787,81 @@ func (m *Manager) ensureLeaseLocked(ctx context.Context, clientIP string, refres
 	}
 	proxy.Status = ProxyActive
 	proxy.ClientIP = clientIP
+	proxy.DrainingFor = ""
+	proxy.FailureCount = 0
+	proxy.SuccessCount++
+	proxy.LastHealthDetail = ""
+	if exitIP != "" {
+		proxy.ExitIP = exitIP
+	}
+	m.removeQueuedLocked(clientIP)
 	m.leases[clientIP] = &LeaseView{ClientIP: clientIP, ProxyID: proxy.ID, Status: LeaseActive, ExpiresAt: expires}
 	_ = m.db.UpsertLease(ctx, store.Lease{ClientIP: clientIP, ProxyID: proxy.ID, Status: LeaseActive, ExpiresAt: expires, UpdatedAt: now})
 	m.db.AddEvent(ctx, clientIP, proxy.ID, "assigned", fmt.Sprintf("refresh=%v", refresh))
 	return Assignment{ClientIP: clientIP, ProxyID: proxy.ID, Status: LeaseActive, ExpiresAt: expires}
 }
 
-func (m *Manager) assignQueuedLocked(ctx context.Context) {
-	for len(m.pendingNew) > 0 {
-		proxy := m.takeIdleProxyLocked()
-		if proxy == nil {
+func (m *Manager) markProbeFailedLocked(ctx context.Context, p *Proxy, err error) {
+	p.FailureCount++
+	p.SuccessCount = 0
+	p.LastHealthDetail = err.Error()
+	p.Status = ProxyUnhealthy
+	p.ClientIP = ""
+	p.DrainingFor = ""
+	m.db.AddEvent(ctx, "", p.ID, "proxy_unhealthy", err.Error())
+	slog.Warn("proxy failed assignment probe", "proxy_id", p.ID, "err", err)
+}
+
+func (m *Manager) processQueueAsync() {
+	m.mu.Lock()
+	if m.queueActive {
+		m.mu.Unlock()
+		return
+	}
+	m.queueActive = true
+	m.mu.Unlock()
+	go func() {
+		m.processQueues(context.Background())
+		m.mu.Lock()
+		m.queueActive = false
+		shouldRestart := m.hasQueuedLocked() && m.hasIdleProxyLocked()
+		m.mu.Unlock()
+		if shouldRestart {
+			m.processQueueAsync()
+		}
+	}()
+}
+
+func (m *Manager) processQueues(ctx context.Context) {
+	for {
+		clientIP, refresh, ok := m.nextQueuedClient()
+		if !ok {
 			return
 		}
+		assignment := m.ensureLease(ctx, clientIP, refresh)
+		if assignment.Status != LeaseActive {
+			return
+		}
+	}
+}
+
+func (m *Manager) nextQueuedClient() (string, bool, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.hasIdleProxyLocked() {
+		return "", false, false
+	}
+	if len(m.pendingNew) > 0 {
 		clientIP := m.pendingNew[0]
 		m.pendingNew = m.pendingNew[1:]
-		now := time.Now()
-		expires := now.Add(m.cfg.LeaseTTL.Duration)
-		proxy.Status = ProxyActive
-		proxy.ClientIP = clientIP
-		m.leases[clientIP] = &LeaseView{ClientIP: clientIP, ProxyID: proxy.ID, Status: LeaseActive, ExpiresAt: expires}
-		_ = m.db.UpsertLease(ctx, store.Lease{ClientIP: clientIP, ProxyID: proxy.ID, Status: LeaseActive, ExpiresAt: expires, UpdatedAt: now})
-		m.db.AddEvent(ctx, clientIP, proxy.ID, "assigned_from_queue", "")
+		return clientIP, false, true
 	}
-	for len(m.pendingRefs) > 0 {
-		proxy := m.takeIdleProxyLocked()
-		if proxy == nil {
-			return
-		}
+	if len(m.pendingRefs) > 0 {
 		clientIP := m.pendingRefs[0]
 		m.pendingRefs = m.pendingRefs[1:]
-		l := m.leases[clientIP]
-		if l == nil || l.Status != LeaseActive {
-			m.markProxyIdleLocked(proxy)
-			continue
-		}
-		if oldProxy := m.proxies[l.ProxyID]; oldProxy != nil {
-			if oldProxy.ActiveConns > 0 {
-				oldProxy.Status = ProxyDraining
-				oldProxy.ClientIP = ""
-				oldProxy.DrainingFor = clientIP
-			} else {
-				m.markProxyIdleLocked(oldProxy)
-			}
-		}
-		now := time.Now()
-		expires := now.Add(m.cfg.LeaseTTL.Duration)
-		proxy.Status = ProxyActive
-		proxy.ClientIP = clientIP
-		m.leases[clientIP] = &LeaseView{ClientIP: clientIP, ProxyID: proxy.ID, Status: LeaseActive, ExpiresAt: expires}
-		_ = m.db.UpsertLease(ctx, store.Lease{ClientIP: clientIP, ProxyID: proxy.ID, Status: LeaseActive, ExpiresAt: expires, UpdatedAt: now})
-		m.db.AddEvent(ctx, clientIP, proxy.ID, "refreshed_from_queue", "")
+		return clientIP, true, true
 	}
+	return "", false, false
 }
 
 func (m *Manager) releaseLocked(ctx context.Context, clientIP string, closeConns bool) {
@@ -780,7 +885,6 @@ func (m *Manager) releaseLocked(ctx context.Context, clientIP string, closeConns
 	if closeConns {
 		go m.CloseClientConnections(clientIP)
 	}
-	m.assignQueuedLocked(ctx)
 }
 
 func (m *Manager) markProxyIdleLocked(p *Proxy) {
@@ -813,6 +917,26 @@ func (m *Manager) takeIdleProxyLocked() *Proxy {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) hasIdleProxyLocked() bool {
+	return m.takeIdleProxyLocked() != nil
+}
+
+func (m *Manager) hasQueuedLocked() bool {
+	return len(m.pendingNew) > 0 || len(m.pendingRefs) > 0
+}
+
+func (m *Manager) defaultProbeProxy(ctx context.Context, p Proxy) (string, error) {
+	timeout := m.cfg.HealthCheck.Timeout.Duration
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+	if err := probeSOCKS(ctx, p, m.cfg.HealthCheck.TargetHost, m.cfg.HealthCheck.TargetPort, timeout); err != nil {
+		return "", err
+	}
+	exitIP := probeExitIP(ctx, p, m.cfg.HealthCheck.ExitIPURL, timeout)
+	return exitIP, nil
 }
 
 func (m *Manager) clientViewsLocked() []ClientView {

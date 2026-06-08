@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -38,7 +39,25 @@ func testManager(t *testing.T, proxies int) *Manager {
 	if err != nil {
 		t.Fatal(err)
 	}
+	m.probeProxy = func(context.Context, Proxy) (string, error) {
+		return "203.0.113.200", nil
+	}
 	return m
+}
+
+func waitForLeaseStatus(t *testing.T, m *Manager, clientIP string, status string) Assignment {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		current := m.Current(clientIP)
+		if current.Status == status {
+			return current
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s, current = %+v", status, current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func TestLeaseUsesIdleProxyAndQueuesWhenFull(t *testing.T) {
@@ -128,8 +147,9 @@ func TestReleaseAssignsQueuedClient(t *testing.T) {
 	m.mu.Lock()
 	m.releaseLocked(context.Background(), "192.0.2.10", false)
 	m.mu.Unlock()
+	m.processQueueAsync()
 
-	current := m.Current("192.0.2.11")
+	current := waitForLeaseStatus(t, m, "192.0.2.11", LeaseActive)
 	if current.Status != LeaseActive || current.ProxyID != "a" {
 		t.Fatalf("queued current = %+v", current)
 	}
@@ -150,7 +170,7 @@ func TestAddProxyAssignsQueuedClient(t *testing.T) {
 	if proxy.ID != "b" {
 		t.Fatalf("proxy = %+v", proxy)
 	}
-	current := m.Current("192.0.2.11")
+	current := waitForLeaseStatus(t, m, "192.0.2.11", LeaseActive)
 	if current.Status != LeaseActive || current.ProxyID != "b" {
 		t.Fatalf("current = %+v", current)
 	}
@@ -164,6 +184,32 @@ func TestDisableIdleProxySkipsAllocation(t *testing.T) {
 	lease := m.Lease("192.0.2.10")
 	if lease.Status != LeaseActive || lease.ProxyID != "b" {
 		t.Fatalf("lease = %+v", lease)
+	}
+}
+
+func TestLeaseProbesProxyBeforeAssignment(t *testing.T) {
+	m := testManager(t, 2)
+	calls := 0
+	m.probeProxy = func(_ context.Context, p Proxy) (string, error) {
+		calls++
+		if p.ID == "a" {
+			return "", errors.New("dial failed")
+		}
+		return "198.51.100.88", nil
+	}
+
+	lease := m.Lease("192.0.2.10")
+	if lease.Status != LeaseActive || lease.ProxyID != "b" {
+		t.Fatalf("lease = %+v", lease)
+	}
+	if calls != 2 {
+		t.Fatalf("probe calls = %d", calls)
+	}
+	if m.proxies["a"].Status != ProxyUnhealthy {
+		t.Fatalf("bad proxy status = %s", m.proxies["a"].Status)
+	}
+	if m.proxies["b"].ExitIP != "198.51.100.88" {
+		t.Fatalf("exit ip = %q", m.proxies["b"].ExitIP)
 	}
 }
 

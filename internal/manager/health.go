@@ -112,7 +112,7 @@ func (m *Manager) recordHealth(ctx context.Context, proxyID string, err error, e
 	if p.Status == ProxyUnhealthy && p.SuccessCount >= m.cfg.HealthCheck.SuccessThreshold {
 		p.Status = m.recoveredProxyStatusLocked(p)
 		m.db.AddEvent(ctx, "", proxyID, "proxy_healthy", "")
-		m.assignQueuedLocked(ctx)
+		go m.processQueueAsync()
 	}
 }
 
@@ -125,8 +125,7 @@ func probeExitIP(ctx context.Context, p Proxy, rawURL string, timeout time.Durat
 	if _, _, err := net.SplitHostPort(host); err != nil {
 		host = net.JoinHostPort(host, "80")
 	}
-	dialer := net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", p.Address)
+	conn, err := DialProxy(ctx, p, timeout)
 	if err != nil {
 		return ""
 	}
@@ -187,8 +186,7 @@ func (m *Manager) recoveredProxyStatusLocked(p *Proxy) string {
 }
 
 func probeSOCKS(ctx context.Context, p Proxy, host string, port int, timeout time.Duration) error {
-	dialer := net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", p.Address)
+	conn, err := DialProxy(ctx, p, timeout)
 	if err != nil {
 		return err
 	}

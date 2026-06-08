@@ -21,7 +21,7 @@
     "blocked_qtypes": ["AAAA", "HTTPS", "SVCB"]
   },
   "health_check": {
-    "enabled": true,
+    "enabled": false,
     "interval": "30s",
     "timeout": "5s",
     "concurrency": 50,
