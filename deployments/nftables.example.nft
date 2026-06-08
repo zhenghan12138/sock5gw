@@ -1,7 +1,5 @@
 #!/usr/sbin/nft -f
 
-flush table inet sock5gw
-
 table inet sock5gw {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
