@@ -872,7 +872,9 @@ func (m *Manager) releaseLocked(ctx context.Context, clientIP string, closeConns
 	delete(m.leases, clientIP)
 	m.removeQueuedLocked(clientIP)
 	if p := m.proxies[l.ProxyID]; p != nil {
-		m.releaseProxyBindingLocked(p)
+		if !m.proxyHasActiveLeaseLocked(l.ProxyID) {
+			m.releaseProxyBindingLocked(p)
+		}
 	}
 	for _, id := range m.proxyOrder {
 		p := m.proxies[id]
@@ -912,11 +914,21 @@ func (m *Manager) releaseProxyBindingLocked(p *Proxy) {
 func (m *Manager) takeIdleProxyLocked() *Proxy {
 	for _, id := range m.proxyOrder {
 		p := m.proxies[id]
-		if p != nil && p.Status == ProxyIdle && !p.Disabled {
+		if p != nil && p.Status == ProxyIdle && !p.Disabled && !m.proxyHasActiveLeaseLocked(p.ID) {
 			return p
 		}
 	}
 	return nil
+}
+
+func (m *Manager) proxyHasActiveLeaseLocked(proxyID string) bool {
+	now := time.Now()
+	for _, lease := range m.leases {
+		if lease.ProxyID == proxyID && lease.Status == LeaseActive && now.Before(lease.ExpiresAt) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) hasIdleProxyLocked() bool {
@@ -935,7 +947,7 @@ func (m *Manager) defaultProbeProxy(ctx context.Context, p Proxy) (string, error
 	if err := probeSOCKS(ctx, p, m.cfg.HealthCheck.TargetHost, m.cfg.HealthCheck.TargetPort, timeout); err != nil {
 		return "", err
 	}
-	exitIP := probeExitIP(ctx, p, m.cfg.HealthCheck.ExitIPURL, timeout)
+	exitIP := probeExitIPAny(ctx, p, m.exitIPURLs(), timeout)
 	return exitIP, nil
 }
 

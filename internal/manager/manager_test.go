@@ -213,6 +213,48 @@ func TestLeaseProbesProxyBeforeAssignment(t *testing.T) {
 	}
 }
 
+func TestIdleProxyWithActiveLeaseIsNotReassigned(t *testing.T) {
+	m := testManager(t, 1)
+	first := m.Lease("192.0.2.10")
+	if first.Status != LeaseActive || first.ProxyID != "a" {
+		t.Fatalf("first = %+v", first)
+	}
+	m.mu.Lock()
+	m.proxies["a"].Status = ProxyIdle
+	m.proxies["a"].ClientIP = ""
+	m.mu.Unlock()
+
+	second := m.Lease("192.0.2.11")
+	if second.Status != LeasePending {
+		t.Fatalf("second = %+v", second)
+	}
+
+	m.mu.Lock()
+	m.releaseLocked(context.Background(), "192.0.2.11", false)
+	if m.proxies["a"].Status != ProxyIdle {
+		t.Fatalf("proxy status = %s", m.proxies["a"].Status)
+	}
+	m.mu.Unlock()
+	current := m.Current("192.0.2.10")
+	if current.Status != LeaseActive || current.ProxyID != "a" {
+		t.Fatalf("current = %+v", current)
+	}
+}
+
+func TestExtractIPSupportsTextAndJSON(t *testing.T) {
+	cases := map[string]string{
+		"198.51.100.10\n":               "198.51.100.10",
+		`{"ip":"198.51.100.11"}`:        "198.51.100.11",
+		`{"query":"198.51.100.12"}`:     "198.51.100.12",
+		`{"origin":"198.51.100.13, x"}`: "198.51.100.13",
+	}
+	for body, want := range cases {
+		if got := extractIP([]byte(body)); got != want {
+			t.Fatalf("extractIP(%q) = %q, want %q", body, got, want)
+		}
+	}
+}
+
 func TestParseKookeeyProxyLine(t *testing.T) {
 	in, err := parseProxyLine("socks5://mobile.kookeey.info:1086:4423363-07c57c6f:06c79d64-global-97891462")
 	if err != nil {

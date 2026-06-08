@@ -3,16 +3,22 @@ package manager
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+var ipPattern = regexp.MustCompile(`(?m)(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{2,}`)
 
 func (m *Manager) healthLoop(ctx context.Context) {
 	ticker := time.NewTicker(m.cfg.HealthCheck.Interval.Duration)
@@ -64,7 +70,7 @@ func (m *Manager) checkAll(ctx context.Context) {
 				err := probeSOCKS(ctx, p, m.cfg.HealthCheck.TargetHost, m.cfg.HealthCheck.TargetPort, m.cfg.HealthCheck.Timeout.Duration)
 				exitIP := ""
 				if err == nil {
-					exitIP = probeExitIP(ctx, p, m.cfg.HealthCheck.ExitIPURL, m.cfg.HealthCheck.Timeout.Duration)
+					exitIP = probeExitIPAny(ctx, p, m.exitIPURLs(), m.cfg.HealthCheck.Timeout.Duration)
 				}
 				m.recordHealth(ctx, p.ID, err, exitIP)
 				atomic.AddInt64(&checked, 1)
@@ -116,14 +122,53 @@ func (m *Manager) recordHealth(ctx context.Context, proxyID string, err error, e
 	}
 }
 
+func (m *Manager) exitIPURLs() []string {
+	defaults := []string{
+		"https://api.ipify.org/",
+		"https://icanhazip.com/",
+		"https://ifconfig.me/ip",
+		"http://api.ipify.org/",
+	}
+	seen := map[string]bool{}
+	var urls []string
+	add := func(raw string) {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" || seen[part] {
+				continue
+			}
+			seen[part] = true
+			urls = append(urls, part)
+		}
+	}
+	add(m.cfg.HealthCheck.ExitIPURL)
+	for _, raw := range defaults {
+		add(raw)
+	}
+	return urls
+}
+
+func probeExitIPAny(ctx context.Context, p Proxy, urls []string, timeout time.Duration) string {
+	for _, rawURL := range urls {
+		if ip := probeExitIP(ctx, p, rawURL, timeout); ip != "" {
+			return ip
+		}
+	}
+	return ""
+}
+
 func probeExitIP(ctx context.Context, p Proxy, rawURL string, timeout time.Duration) string {
 	u, err := url.Parse(rawURL)
-	if err != nil || u.Scheme != "http" || u.Host == "" {
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return ""
 	}
 	host := u.Host
 	if _, _, err := net.SplitHostPort(host); err != nil {
-		host = net.JoinHostPort(host, "80")
+		port := "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+		host = net.JoinHostPort(host, port)
 	}
 	conn, err := DialProxy(ctx, p, timeout)
 	if err != nil {
@@ -134,6 +179,13 @@ func probeExitIP(ctx context.Context, p Proxy, rawURL string, timeout time.Durat
 	if err := ConnectSOCKS5(conn, host, p.Username, p.Password); err != nil {
 		return ""
 	}
+	if u.Scheme == "https" {
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return ""
+		}
+		conn = tlsConn
+	}
 	path := u.RequestURI()
 	if path == "" {
 		path = "/"
@@ -143,28 +195,50 @@ func probeExitIP(ctx context.Context, p Proxy, rawURL string, timeout time.Durat
 		return ""
 	}
 	br := bufio.NewReader(conn)
-	line, err := br.ReadString('\n')
-	if err != nil || !strings.Contains(line, "200") {
-		return ""
-	}
-	for {
-		header, err := br.ReadString('\n')
-		if err != nil {
-			return ""
-		}
-		if header == "\r\n" {
-			break
-		}
-	}
-	body, err := io.ReadAll(io.LimitReader(br, 128))
+	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		return ""
 	}
-	ip := strings.TrimSpace(string(body))
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ""
+	}
+	ip := extractIP(body)
 	if net.ParseIP(ip) == nil {
 		return ""
 	}
 	return ip
+}
+
+func extractIP(body []byte) string {
+	text := strings.TrimSpace(string(body))
+	if ip := net.ParseIP(text); ip != nil {
+		return ip.String()
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err == nil {
+		for _, key := range []string{"ip", "query", "origin"} {
+			if value, ok := payload[key].(string); ok {
+				if ip := firstIP(value); ip != "" {
+					return ip
+				}
+			}
+		}
+	}
+	return firstIP(text)
+}
+
+func firstIP(text string) string {
+	for _, candidate := range ipPattern.FindAllString(text, -1) {
+		if ip := net.ParseIP(strings.Trim(candidate, "[]")); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 func (m *Manager) recoveredProxyStatusLocked(p *Proxy) string {
