@@ -185,6 +185,15 @@ func (m *Manager) Lease(clientIP string) Assignment {
 	return m.ensureLeaseLocked(context.Background(), clientIP, false)
 }
 
+func (m *Manager) AdminLease(clientIP string) (Assignment, error) {
+	if ip := net.ParseIP(clientIP); ip == nil || ip.To4() == nil {
+		return Assignment{}, errors.New("valid IPv4 client_ip is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ensureLeaseLocked(context.Background(), clientIP, false), nil
+}
+
 func (m *Manager) Refresh(clientIP string) Assignment {
 	m.mu.Lock()
 	defer m.mu.Unlock()

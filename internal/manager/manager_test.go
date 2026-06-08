@@ -193,3 +193,17 @@ func TestImportProxiesSkipsDuplicates(t *testing.T) {
 		t.Fatalf("result = %+v", result)
 	}
 }
+
+func TestAdminLeaseRequiresIPv4AndAssignsProxy(t *testing.T) {
+	m := testManager(t, 1)
+	if _, err := m.AdminLease("not-an-ip"); err == nil {
+		t.Fatal("expected invalid ip error")
+	}
+	assignment, err := m.AdminLease("192.0.2.20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignment.Status != LeaseActive || assignment.ProxyID != "a" {
+		t.Fatalf("assignment = %+v", assignment)
+	}
+}

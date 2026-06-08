@@ -45,6 +45,25 @@ func NewAPI(m *Manager, cfg config.API) http.Handler {
 		}
 		writeJSON(w, m.Status())
 	})
+	mux.HandleFunc("POST /v1/admin/leases", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var in struct {
+			ClientIP string `json:"client_ip"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		assignment, err := m.AdminLease(strings.TrimSpace(in.ClientIP))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, assignment)
+	})
 	mux.HandleFunc("POST /v1/admin/proxies", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.AdminKey) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -208,6 +227,10 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         <thead><tr><th>客户端 IP</th><th>状态</th><th>代理</th><th>出口 IP</th><th>连接数</th><th>到期时间</th><th>操作</th></tr></thead>
         <tbody id="clients"></tbody>
       </table>
+      <form id="clientForm" style="grid-template-columns:1fr auto;">
+        <input name="client_ip" placeholder="手动添加客户端 IP，例如 192.168.2.50" required>
+        <button class="primary">添加客户端</button>
+      </form>
     </section>
     <section>
       <div class="section-head"><h2>代理池</h2><span class="muted">出口 IP 由健康检查通过 SOCKS5 获取</span></div>
@@ -268,6 +291,13 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       e.preventDefault();
       const fd = new FormData(e.currentTarget);
       await api('/v1/admin/proxies', { method:'POST', body: JSON.stringify(Object.fromEntries(fd.entries())) });
+      e.currentTarget.reset();
+      load();
+    });
+    document.getElementById('clientForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const fd = new FormData(e.currentTarget);
+      await api('/v1/admin/leases', { method:'POST', body: JSON.stringify(Object.fromEntries(fd.entries())) });
       e.currentTarget.reset();
       load();
     });
