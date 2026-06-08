@@ -459,16 +459,28 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     });
     async function importProxies() {
       const text = document.getElementById('importText').value;
-      const result = await api('/v1/admin/proxies/import', { method:'POST', body:text, headers:{'Content-Type':'text/plain'} });
-      document.getElementById('importResult').textContent = '导入 '+result.imported+'，跳过 '+result.skipped+(result.errors?.length ? '，错误 '+result.errors.length : '');
-      if (!result.errors?.length) document.getElementById('importText').value = '';
-      load();
+      const el = document.getElementById('importResult');
+      el.textContent = '导入中...';
+      try {
+        const result = await api('/v1/admin/proxies/import', { method:'POST', body:text, headers:{'Content-Type':'text/plain'} });
+        el.textContent = '导入 '+result.imported+'，跳过 '+result.skipped+(result.errors?.length ? '，错误 '+result.errors.length+': '+result.errors.slice(0,2).join(' | ') : '');
+        if (!result.errors?.length) document.getElementById('importText').value = '';
+        load();
+      } catch (err) {
+        el.textContent = '导入失败：' + err.message;
+      }
     }
     async function importSubscription() {
       const url = document.getElementById('subscriptionURL').value;
-      const result = await api('/v1/admin/proxies/import-url', { method:'POST', body: JSON.stringify({ url }) });
-      document.getElementById('subscriptionResult').textContent = '导入 '+result.imported+'，跳过 '+result.skipped+(result.errors?.length ? '，错误 '+result.errors.length : '');
-      load();
+      const el = document.getElementById('subscriptionResult');
+      el.textContent = '订阅拉取中...';
+      try {
+        const result = await api('/v1/admin/proxies/import-url', { method:'POST', body: JSON.stringify({ url }) });
+        el.textContent = '导入 '+result.imported+'，跳过 '+result.skipped+(result.errors?.length ? '，错误 '+result.errors.length+': '+result.errors.slice(0,2).join(' | ') : '');
+        load();
+      } catch (err) {
+        el.textContent = '订阅导入失败：' + err.message;
+      }
     }
     load().catch(err => alert(err.message));
     setInterval(() => load().catch(console.error), 5000);
