@@ -1,17 +1,24 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"html/template"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/oschwald/geoip2-golang"
 
 	"sock5gw/internal/config"
 )
 
 func NewAPI(m *Manager, cfg config.API) http.Handler {
+	ipGeo := newIPGeoCache(cfg.GeoIPDBPath)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -44,6 +51,20 @@ func NewAPI(m *Manager, cfg config.API) http.Handler {
 			return
 		}
 		writeJSON(w, m.Status())
+	})
+	mux.HandleFunc("POST /v1/admin/ip-geo", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var in struct {
+			IPs []string `json:"ips"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, ipGeo.LookupMany(r.Context(), in.IPs))
 	})
 	mux.HandleFunc("POST /v1/admin/leases", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.AdminKey) {
@@ -340,8 +361,20 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     let allProxies = [];
     let selectedProxyIds = new Set();
     let proxyPage = 1;
+    let ipGeo = {};
     const fmtTime = v => v ? new Date(v).toLocaleString() : '-';
     function setText(el, text) { el.textContent = text == null || text === '' ? '-' : String(text); }
+    function setIPText(el, ip) {
+      if (!ip) { setText(el, ip); return; }
+      const code = ipGeo[ip]?.country_code;
+      const flag = countryFlag(code);
+      el.textContent = flag ? flag + ' ' + ip : ip;
+    }
+    function countryFlag(code) {
+      code = String(code || '').toUpperCase();
+      if (!/^[A-Z]{2}$/.test(code)) return '';
+      return String.fromCodePoint(...[...code].map(c => 127397 + c.charCodeAt(0)));
+    }
     function appendPill(td, status) {
       const span = document.createElement('span');
       span.className = 'pill ' + String(status || '').replaceAll('_','-');
@@ -359,6 +392,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       const clients = data.clients || [];
       const proxies = data.proxies || [];
       allProxies = proxies;
+      await loadIPGeo(clients, proxies);
       document.getElementById('clientCount').textContent = clients.length;
       document.getElementById('proxyCount').textContent = proxies.length;
       document.getElementById('idleCount').textContent = proxies.filter(p => p.status === 'idle').length;
@@ -372,7 +406,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         const status = tr.insertCell(); appendPill(status, c.status);
         const proxy = tr.insertCell(); setText(proxy, c.proxy_id);
         const proxyAddr = document.createElement('div'); proxyAddr.className = 'muted'; proxyAddr.textContent = c.proxy_address || ''; proxy.appendChild(proxyAddr);
-        setText(tr.insertCell(), c.exit_ip);
+        setIPText(tr.insertCell(), c.exit_ip);
         setText(tr.insertCell(), c.active_connections || 0);
         setText(tr.insertCell(), fmtTime(c.expires_at));
         const actions = tr.insertCell();
@@ -382,6 +416,18 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         clientBody.appendChild(tr);
       });
       renderProxyPage();
+    }
+    async function loadIPGeo(clients, proxies) {
+      const ips = new Set();
+      clients.forEach(c => { if (c.exit_ip) ips.add(c.exit_ip); });
+      proxies.forEach(p => { if (p.exit_ip) ips.add(p.exit_ip); });
+      const missing = Array.from(ips).filter(ip => !ipGeo[ip]);
+      if (!missing.length) return;
+      try {
+        ipGeo = { ...ipGeo, ...await api('/v1/admin/ip-geo', { method:'POST', body: JSON.stringify({ ips: missing }) }) };
+      } catch (err) {
+        console.warn('ip geo lookup failed', err);
+      }
     }
     function currentPageSize() { return Number(document.getElementById('pageSize')?.value || 50); }
     function pageCount() { return Math.max(1, Math.ceil(allProxies.length / currentPageSize())); }
@@ -406,7 +452,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         setText(tr.insertCell(), p.id);
         setText(tr.insertCell(), p.address);
         appendPill(tr.insertCell(), p.status);
-        setText(tr.insertCell(), p.exit_ip);
+        setIPText(tr.insertCell(), p.exit_ip);
         setText(tr.insertCell(), p.client_ip || p.draining_for);
         setText(tr.insertCell(), p.active_connections || 0);
         const detail = tr.insertCell(); detail.className = 'muted'; setText(detail, p.last_health_detail);
@@ -535,4 +581,108 @@ func clientIP(r *http.Request, trustProxy bool) string {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+type ipGeoInfo struct {
+	CountryCode string `json:"country_code,omitempty"`
+}
+
+type ipGeoEntry struct {
+	info      ipGeoInfo
+	expiresAt time.Time
+}
+
+type ipGeoCache struct {
+	mu      sync.Mutex
+	db      *geoip2.Reader
+	entries map[string]ipGeoEntry
+}
+
+func newIPGeoCache(path string) *ipGeoCache {
+	cache := &ipGeoCache{
+		entries: map[string]ipGeoEntry{},
+	}
+	if strings.TrimSpace(path) == "" {
+		return cache
+	}
+	db, err := geoip2.Open(path)
+	if err != nil {
+		slog.Warn("geoip database unavailable", "path", path, "err", err)
+		return cache
+	}
+	cache.db = db
+	slog.Info("geoip database loaded", "path", path)
+	return cache
+}
+
+func (c *ipGeoCache) LookupMany(ctx context.Context, ips []string) map[string]ipGeoInfo {
+	out := map[string]ipGeoInfo{}
+	for _, ip := range uniqueIPs(ips) {
+		if info := c.Lookup(ctx, ip); info.CountryCode != "" {
+			out[ip] = info
+		}
+	}
+	return out
+}
+
+func (c *ipGeoCache) Lookup(ctx context.Context, ip string) ipGeoInfo {
+	_ = ctx
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ipGeoInfo{}
+	}
+	now := time.Now()
+	c.mu.Lock()
+	if entry, ok := c.entries[ip]; ok && now.Before(entry.expiresAt) {
+		c.mu.Unlock()
+		return entry.info
+	}
+	c.mu.Unlock()
+
+	info := c.lookup(parsed)
+	c.mu.Lock()
+	c.entries[ip] = ipGeoEntry{info: info, expiresAt: now.Add(24 * time.Hour)}
+	c.mu.Unlock()
+	return info
+}
+
+func (c *ipGeoCache) lookup(ip net.IP) ipGeoInfo {
+	if c.db == nil {
+		return ipGeoInfo{}
+	}
+	record, err := c.db.Country(ip)
+	if err != nil {
+		return ipGeoInfo{}
+	}
+	if validCountryCode(record.Country.IsoCode) {
+		return ipGeoInfo{CountryCode: strings.ToUpper(record.Country.IsoCode)}
+	}
+	return ipGeoInfo{}
+}
+
+func validCountryCode(code string) bool {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if len(code) != 2 {
+		return false
+	}
+	for _, r := range code {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+func uniqueIPs(ips []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" || seen[ip] || net.ParseIP(ip) == nil {
+			continue
+		}
+		seen[ip] = true
+		out = append(out, ip)
+	}
+	return out
 }

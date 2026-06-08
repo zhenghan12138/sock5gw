@@ -5,7 +5,8 @@
     "listen": "0.0.0.0:8080",
     "client_key": "change-client-token",
     "admin_key": "change-admin-token",
-    "trust_proxy_headers": false
+    "trust_proxy_headers": false,
+    "geoip_db_path": "/etc/sock5gw/GeoLite2-Country.mmdb"
   },
   "gateway": {
     "listen": "0.0.0.0:15001",

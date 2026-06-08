@@ -20,10 +20,11 @@ type Config struct {
 }
 
 type API struct {
-	Listen     string `json:"listen"`
-	ClientKey  string `json:"client_key"`
-	AdminKey   string `json:"admin_key"`
-	TrustProxy bool   `json:"trust_proxy_headers"`
+	Listen      string `json:"listen"`
+	ClientKey   string `json:"client_key"`
+	AdminKey    string `json:"admin_key"`
+	TrustProxy  bool   `json:"trust_proxy_headers"`
+	GeoIPDBPath string `json:"geoip_db_path"`
 }
 
 type Gateway struct {
