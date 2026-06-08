@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +29,7 @@ func (m *Manager) healthLoop(ctx context.Context) {
 }
 
 func (m *Manager) checkAll(ctx context.Context) {
+	start := time.Now()
 	m.mu.Lock()
 	proxies := make([]Proxy, 0, len(m.proxies))
 	for _, id := range m.proxyOrder {
@@ -35,14 +38,46 @@ func (m *Manager) checkAll(ctx context.Context) {
 		}
 	}
 	m.mu.Unlock()
-	for _, p := range proxies {
-		err := probeSOCKS(ctx, p, m.cfg.HealthCheck.TargetHost, m.cfg.HealthCheck.TargetPort, m.cfg.HealthCheck.Timeout.Duration)
-		exitIP := ""
-		if err == nil {
-			exitIP = probeExitIP(ctx, p, m.cfg.HealthCheck.ExitIPURL, m.cfg.HealthCheck.Timeout.Duration)
-		}
-		m.recordHealth(ctx, p.ID, err, exitIP)
+	workers := m.cfg.HealthCheck.Concurrency
+	if workers < 1 {
+		workers = 1
 	}
+	if workers > len(proxies) && len(proxies) > 0 {
+		workers = len(proxies)
+	}
+	jobs := make(chan Proxy)
+	var checked int64
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				err := probeSOCKS(ctx, p, m.cfg.HealthCheck.TargetHost, m.cfg.HealthCheck.TargetPort, m.cfg.HealthCheck.Timeout.Duration)
+				exitIP := ""
+				if err == nil {
+					exitIP = probeExitIP(ctx, p, m.cfg.HealthCheck.ExitIPURL, m.cfg.HealthCheck.Timeout.Duration)
+				}
+				m.recordHealth(ctx, p.ID, err, exitIP)
+				atomic.AddInt64(&checked, 1)
+			}
+		}()
+	}
+	for _, p := range proxies {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return
+		case jobs <- p:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	slog.Info("health check completed", "checked", checked, "total", len(proxies), "concurrency", workers, "duration", time.Since(start).String())
 }
 
 func (m *Manager) recordHealth(ctx context.Context, proxyID string, err error, exitIP string) {

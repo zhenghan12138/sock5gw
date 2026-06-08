@@ -45,6 +45,7 @@ type HealthCheck struct {
 	Enabled          bool     `json:"enabled"`
 	Interval         Duration `json:"interval"`
 	Timeout          Duration `json:"timeout"`
+	Concurrency      int      `json:"concurrency"`
 	TargetHost       string   `json:"target_host"`
 	TargetPort       int      `json:"target_port"`
 	ExitIPURL        string   `json:"exit_ip_url"`
@@ -134,6 +135,9 @@ func (cfg *Config) setDefaults() {
 	}
 	if cfg.HealthCheck.Timeout.Duration == 0 {
 		cfg.HealthCheck.Timeout.Duration = 5 * time.Second
+	}
+	if cfg.HealthCheck.Concurrency == 0 {
+		cfg.HealthCheck.Concurrency = 50
 	}
 	if cfg.HealthCheck.TargetHost == "" {
 		cfg.HealthCheck.TargetHost = "example.com"

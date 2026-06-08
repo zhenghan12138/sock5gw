@@ -24,6 +24,7 @@
     "enabled": true,
     "interval": "30s",
     "timeout": "5s",
+    "concurrency": 50,
     "target_host": "example.com",
     "target_port": 80,
     "exit_ip_url": "http://api.ipify.org/",
