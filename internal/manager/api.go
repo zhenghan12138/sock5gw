@@ -3,6 +3,7 @@ package manager
 import (
 	"encoding/json"
 	"html/template"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -60,6 +61,29 @@ func NewAPI(m *Manager, cfg config.API) http.Handler {
 			return
 		}
 		writeJSON(w, p)
+	})
+	mux.HandleFunc("POST /v1/admin/proxies/import", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 16*1024*1024))
+		if err != nil {
+			http.Error(w, "read body failed", http.StatusBadRequest)
+			return
+		}
+		text := string(body)
+		if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+			var in struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(body, &in); err != nil {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+			text = in.Text
+		}
+		writeJSON(w, m.ImportProxies(r.Context(), text))
 	})
 	mux.HandleFunc("PUT /v1/admin/proxies/{id}", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.AdminKey) {
@@ -155,7 +179,9 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     .unhealthy,.blocked { background:#fef3f2; color:var(--bad); }
     .disabled { background:#f2f4f7; color:#475467; }
     form { display:grid; grid-template-columns:1fr 1.2fr 1fr 1fr auto; gap:8px; padding:14px 16px; border-top:1px solid var(--line); }
-    input { height:34px; border:1px solid var(--line); border-radius:6px; padding:0 10px; min-width:0; }
+    input, textarea { border:1px solid var(--line); border-radius:6px; padding:8px 10px; min-width:0; font:inherit; }
+    input { height:34px; }
+    textarea { width:100%; min-height:150px; resize:vertical; }
     button { height:32px; border:1px solid var(--line); background:#fff; border-radius:6px; padding:0 10px; cursor:pointer; }
     button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
     button.danger { color:var(--bad); }
@@ -196,6 +222,10 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         <input name="password" placeholder="密码，可空" type="password">
         <button class="primary">新增代理</button>
       </form>
+      <div style="padding:14px 16px; border-top:1px solid var(--line); display:grid; gap:8px;">
+        <textarea id="importText" placeholder="批量粘贴代理，每行一个。支持 socks5://host:port:user:pass、socks5://user:pass@host:port、host:port:user:pass"></textarea>
+        <div><button class="primary" onclick="importProxies()">批量导入</button> <span id="importResult" class="muted"></span></div>
+      </div>
     </section>
   </main>
   <script>
@@ -241,6 +271,13 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       e.currentTarget.reset();
       load();
     });
+    async function importProxies() {
+      const text = document.getElementById('importText').value;
+      const result = await api('/v1/admin/proxies/import', { method:'POST', body:text, headers:{'Content-Type':'text/plain'} });
+      document.getElementById('importResult').textContent = '导入 '+result.imported+'，跳过 '+result.skipped+(result.errors?.length ? '，错误 '+result.errors.length : '');
+      if (!result.errors?.length) document.getElementById('importText').value = '';
+      load();
+    }
     load().catch(err => alert(err.message));
     setInterval(() => load().catch(console.error), 5000);
   </script>

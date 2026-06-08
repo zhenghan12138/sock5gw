@@ -1,12 +1,18 @@
 package manager
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,6 +82,12 @@ type ClientView struct {
 	ActiveConnections int       `json:"active_connections"`
 	ExpiresAt         time.Time `json:"expires_at,omitempty"`
 	Queued            bool      `json:"queued"`
+}
+
+type ImportResult struct {
+	Imported int      `json:"imported"`
+	Skipped  int      `json:"skipped"`
+	Errors   []string `json:"errors,omitempty"`
 }
 
 type Manager struct {
@@ -314,6 +326,40 @@ func (m *Manager) AddProxy(ctx context.Context, in ProxyInput) (*Proxy, error) {
 	m.assignQueuedLocked(ctx)
 	cp := *p
 	return &cp, nil
+}
+
+func (m *Manager) ImportProxies(ctx context.Context, text string) ImportResult {
+	result := ImportResult{}
+	scanner := bufio.NewScanner(strings.NewReader(text))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		in, err := parseProxyLine(line)
+		if err != nil {
+			result.Skipped++
+			result.Errors = append(result.Errors, fmt.Sprintf("line %d: %v", lineNo, err))
+			continue
+		}
+		if _, err := m.AddProxy(ctx, in); err != nil {
+			if strings.Contains(err.Error(), "already exists") {
+				result.Skipped++
+				continue
+			}
+			result.Skipped++
+			result.Errors = append(result.Errors, fmt.Sprintf("line %d: %v", lineNo, err))
+			continue
+		}
+		result.Imported++
+	}
+	if err := scanner.Err(); err != nil {
+		result.Errors = append(result.Errors, err.Error())
+	}
+	return result
 }
 
 func (m *Manager) UpdateProxy(ctx context.Context, id string, in ProxyInput) (*Proxy, error) {
@@ -587,6 +633,79 @@ func (m *Manager) clientConnectionCountLocked(clientIP string) int {
 		}
 	}
 	return total
+}
+
+func parseProxyLine(line string) (ProxyInput, error) {
+	if strings.Contains(line, "://") {
+		return parseProxyURL(line)
+	}
+	parts := strings.Split(line, ":")
+	if len(parts) < 2 {
+		return ProxyInput{}, errors.New("expected host:port[:username:password]")
+	}
+	host := parts[0]
+	port := parts[1]
+	if host == "" || port == "" {
+		return ProxyInput{}, errors.New("host and port are required")
+	}
+	if _, err := strconv.Atoi(port); err != nil {
+		return ProxyInput{}, errors.New("invalid port")
+	}
+	in := ProxyInput{Address: net.JoinHostPort(host, port)}
+	if len(parts) >= 3 {
+		in.Username = parts[2]
+	}
+	if len(parts) >= 4 {
+		in.Password = strings.Join(parts[3:], ":")
+	}
+	in.ID = proxyID(in)
+	return in, nil
+}
+
+func parseProxyURL(raw string) (ProxyInput, error) {
+	if strings.HasPrefix(raw, "socks5://") && strings.Count(raw, "@") == 0 {
+		trimmed := strings.TrimPrefix(raw, "socks5://")
+		parts := strings.Split(trimmed, ":")
+		if len(parts) >= 4 {
+			in := ProxyInput{
+				Address:  net.JoinHostPort(parts[0], parts[1]),
+				Username: parts[2],
+				Password: strings.Join(parts[3:], ":"),
+			}
+			if _, err := strconv.Atoi(parts[1]); err != nil {
+				return ProxyInput{}, errors.New("invalid port")
+			}
+			in.ID = proxyID(in)
+			return in, nil
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ProxyInput{}, err
+	}
+	if u.Scheme != "socks5" && u.Scheme != "socks" {
+		return ProxyInput{}, errors.New("only socks5 URLs are supported")
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if host == "" || port == "" {
+		return ProxyInput{}, errors.New("host and port are required")
+	}
+	if _, err := strconv.Atoi(port); err != nil {
+		return ProxyInput{}, errors.New("invalid port")
+	}
+	in := ProxyInput{Address: net.JoinHostPort(host, port)}
+	if u.User != nil {
+		in.Username = u.User.Username()
+		in.Password, _ = u.User.Password()
+	}
+	in.ID = proxyID(in)
+	return in, nil
+}
+
+func proxyID(in ProxyInput) string {
+	sum := sha1.Sum([]byte(in.Address + "|" + in.Username + "|" + in.Password))
+	return "proxy-" + hex.EncodeToString(sum[:])[:12]
 }
 
 func (m *Manager) enqueueUniqueLocked(queue *[]string, clientIP string) {

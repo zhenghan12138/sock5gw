@@ -166,3 +166,30 @@ func TestDisableIdleProxySkipsAllocation(t *testing.T) {
 		t.Fatalf("lease = %+v", lease)
 	}
 }
+
+func TestParseKookeeyProxyLine(t *testing.T) {
+	in, err := parseProxyLine("socks5://mobile.kookeey.info:1086:4423363-07c57c6f:06c79d64-global-97891462")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Address != "mobile.kookeey.info:1086" {
+		t.Fatalf("address = %q", in.Address)
+	}
+	if in.Username != "4423363-07c57c6f" {
+		t.Fatalf("username = %q", in.Username)
+	}
+	if in.Password != "06c79d64-global-97891462" {
+		t.Fatalf("password = %q", in.Password)
+	}
+	if in.ID == "" {
+		t.Fatal("empty id")
+	}
+}
+
+func TestImportProxiesSkipsDuplicates(t *testing.T) {
+	m := testManager(t, 0)
+	result := m.ImportProxies(context.Background(), "127.0.0.1:1080:u:p\n127.0.0.1:1080:u:p\n")
+	if result.Imported != 1 || result.Skipped != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+}
