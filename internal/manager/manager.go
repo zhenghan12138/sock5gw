@@ -207,6 +207,13 @@ func (m *Manager) AdminLease(clientIP string) (Assignment, error) {
 	return m.ensureLease(context.Background(), clientIP, false), nil
 }
 
+func (m *Manager) AdminRefresh(clientIP string) (Assignment, error) {
+	if ip := net.ParseIP(clientIP); ip == nil || ip.To4() == nil {
+		return Assignment{}, errors.New("valid IPv4 client_ip is required")
+	}
+	return m.ensureLease(context.Background(), clientIP, true), nil
+}
+
 func (m *Manager) Refresh(clientIP string) Assignment {
 	return m.ensureLease(context.Background(), clientIP, true)
 }

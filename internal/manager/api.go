@@ -214,6 +214,18 @@ func NewAPI(m *Manager, cfg config.API) http.Handler {
 		m.Release(ip)
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("POST /v1/admin/leases/{ip}/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		assignment, err := m.AdminRefresh(strings.TrimSpace(r.PathValue("ip")))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, assignment)
+	})
 	return mux
 }
 
@@ -364,6 +376,8 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         setText(tr.insertCell(), c.active_connections || 0);
         setText(tr.insertCell(), fmtTime(c.expires_at));
         const actions = tr.insertCell();
+        const refresh = document.createElement('button'); refresh.textContent = '刷新代理'; refresh.onclick = () => refreshLease(c.client_ip, refresh); actions.appendChild(refresh);
+        actions.appendChild(document.createTextNode(' '));
         const btn = document.createElement('button'); btn.className = 'danger'; btn.textContent = '释放'; btn.onclick = () => releaseLease(c.client_ip); actions.appendChild(btn);
         clientBody.appendChild(tr);
       });
@@ -417,6 +431,14 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       renderProxyPage();
     }
     async function releaseLease(ip) { await api('/v1/admin/leases/' + encodeURIComponent(ip), { method:'DELETE' }); load(); }
+    async function refreshLease(ip, btn) {
+      if (btn) { btn.disabled = true; btn.textContent = '刷新中'; }
+      try {
+        await api('/v1/admin/leases/' + encodeURIComponent(ip) + '/refresh', { method:'POST', body:'{}' });
+      } finally {
+        load();
+      }
+    }
     async function deleteProxy(id) { await api('/v1/admin/proxies/' + encodeURIComponent(id), { method:'DELETE' }); load(); }
     async function batchDisable(disabled) {
       const ids = Array.from(selectedProxyIds);

@@ -296,6 +296,27 @@ func TestAdminLeaseRequiresIPv4AndAssignsProxy(t *testing.T) {
 	}
 }
 
+func TestAdminRefreshRequiresIPv4AndRefreshesProxy(t *testing.T) {
+	m := testManager(t, 2)
+	if _, err := m.AdminRefresh("not-an-ip"); err == nil {
+		t.Fatal("expected invalid ip error")
+	}
+	lease := m.Lease("192.0.2.20")
+	if lease.ProxyID != "a" {
+		t.Fatalf("lease = %+v", lease)
+	}
+	refreshed, err := m.AdminRefresh("192.0.2.20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Status != LeaseActive || refreshed.ProxyID != "b" {
+		t.Fatalf("refresh = %+v", refreshed)
+	}
+	if m.proxies["b"].ExitIP != "203.0.113.200" {
+		t.Fatalf("exit ip = %q", m.proxies["b"].ExitIP)
+	}
+}
+
 func TestImportProxyPayloadKookeeyJSON(t *testing.T) {
 	m := testManager(t, 0)
 	payload := []byte(`{"success":true,"data":[{"username":"u","password":"p","ip":"mobile.kookeey.info","port":1086}]}`)
