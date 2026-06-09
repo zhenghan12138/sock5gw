@@ -17,7 +17,7 @@ import (
 	"sock5gw/internal/config"
 )
 
-func NewAPI(m *Manager, cfg config.API) http.Handler {
+func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler {
 	ipGeo := newIPGeoCache(cfg.GeoIPDBPath)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin/", func(w http.ResponseWriter, r *http.Request) {
@@ -51,6 +51,37 @@ func NewAPI(m *Manager, cfg config.API) http.Handler {
 			return
 		}
 		writeJSON(w, m.Status())
+	})
+	mux.HandleFunc("GET /v1/admin/routing", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if runtimeCfg == nil {
+			http.Error(w, "runtime config unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, runtimeCfg.Routing())
+	})
+	mux.HandleFunc("PUT /v1/admin/routing", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if runtimeCfg == nil {
+			http.Error(w, "runtime config unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var in config.Routing
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if err := runtimeCfg.UpdateRouting(in); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, runtimeCfg.Routing())
 	})
 	mux.HandleFunc("POST /v1/admin/ip-geo", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.AdminKey) {
@@ -316,6 +347,28 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       </form>
     </section>
     <section>
+      <div class="section-head"><h2>域名分流</h2><button onclick="loadRouting()">刷新配置</button></div>
+      <form id="routingForm" style="grid-template-columns:120px 1fr 160px 1fr auto;">
+        <label class="muted"><input id="routingEnabled" type="checkbox"> 启用</label>
+        <input id="geositePath" placeholder="/etc/sock5gw/geosite.dat">
+        <select id="defaultAction">
+          <option value="proxy">默认代理</option>
+          <option value="direct">默认直连</option>
+          <option value="block">默认阻断</option>
+        </select>
+        <input id="routingHint" value="规则支持 geosite/domain_suffix/domain_exact/keyword/regex" readonly>
+        <button class="primary">保存分流</button>
+      </form>
+      <div style="padding:14px 16px; border-top:1px solid var(--line); display:grid; gap:8px;">
+        <textarea id="routingRules" placeholder='[
+  {"type":"geosite","value":"geosite:cn","action":"direct"},
+  {"type":"geosite","value":"geosite:category-ads-all","action":"block"},
+  {"type":"domain_suffix","value":"google.com","action":"proxy"}
+]'></textarea>
+        <span id="routingResult" class="muted"></span>
+      </div>
+    </section>
+    <section>
 			<div class="section-head"><h2>代理池</h2><span class="muted">出口 IP 在分配客户端前通过 SOCKS5 检测获取</span></div>
       <div style="padding:12px 16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
         <button onclick="batchDisable(false)">批量启用</button>
@@ -362,6 +415,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     let selectedProxyIds = new Set();
     let proxyPage = 1;
     let ipGeo = {};
+    let routingConfig = null;
     const fmtTime = v => v ? new Date(v).toLocaleString() : '-';
     function setText(el, text) { el.textContent = text == null || text === '' ? '-' : String(text); }
     function setIPText(el, ip) {
@@ -416,6 +470,14 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         clientBody.appendChild(tr);
       });
       renderProxyPage();
+    }
+    async function loadRouting() {
+      routingConfig = await api('/v1/admin/routing');
+      document.getElementById('routingEnabled').checked = !!routingConfig.enabled;
+      document.getElementById('geositePath').value = routingConfig.geosite_path || '';
+      document.getElementById('defaultAction').value = routingConfig.default_action || 'proxy';
+      document.getElementById('routingRules').value = JSON.stringify(routingConfig.rules || [], null, 2);
+      document.getElementById('routingResult').textContent = routingConfig.enabled ? '当前已启用' : '当前未启用';
     }
     async function loadIPGeo(clients, proxies) {
       const ips = new Set();
@@ -525,6 +587,24 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       e.currentTarget.reset();
       load();
     });
+    document.getElementById('routingForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const el = document.getElementById('routingResult');
+      el.textContent = '保存中...';
+      try {
+        const rules = JSON.parse(document.getElementById('routingRules').value || '[]');
+        const next = {
+          enabled: document.getElementById('routingEnabled').checked,
+          geosite_path: document.getElementById('geositePath').value.trim(),
+          default_action: document.getElementById('defaultAction').value,
+          rules
+        };
+        routingConfig = await api('/v1/admin/routing', { method:'PUT', body: JSON.stringify(next) });
+        el.textContent = '已保存并热更新';
+      } catch (err) {
+        el.textContent = '保存失败：' + err.message;
+      }
+    });
     async function importProxies() {
       const text = document.getElementById('importText').value;
       const el = document.getElementById('importResult');
@@ -551,6 +631,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       }
     }
     load().catch(err => alert(err.message));
+    loadRouting().catch(console.error);
     setInterval(() => load().catch(console.error), 5000);
   </script>
 </body>

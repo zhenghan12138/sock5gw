@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sock5gw/internal/config"
@@ -25,14 +26,24 @@ type Manager interface {
 }
 
 type Gateway struct {
-	cfg    config.Gateway
-	dns    config.DNS
-	mgr    Manager
-	router *routing.Matcher
+	cfg      config.Gateway
+	dns      config.DNS
+	mgr      Manager
+	router   atomic.Pointer[routing.Matcher]
+	fallback *routing.Matcher
 }
 
 func New(cfg config.Gateway, dns config.DNS, mgr Manager, router *routing.Matcher) *Gateway {
-	return &Gateway{cfg: cfg, dns: dns, mgr: mgr, router: router}
+	g := &Gateway{cfg: cfg, dns: dns, mgr: mgr, fallback: router}
+	g.router.Store(router)
+	return g
+}
+
+func (g *Gateway) SetRouter(router *routing.Matcher) {
+	if router == nil {
+		router = g.fallback
+	}
+	g.router.Store(router)
 }
 
 func (g *Gateway) Run(ctx context.Context) error {
@@ -74,7 +85,7 @@ func (g *Gateway) handle(client net.Conn) {
 		slog.Debug("blocked target", "client_ip", clientIP, "target", target)
 		return
 	}
-	switch g.router.ActionFor(target) {
+	switch g.routeAction(target) {
 	case routing.ActionBlock:
 		slog.Debug("routing blocked target", "client_ip", clientIP, "target", target)
 		return
@@ -83,6 +94,14 @@ func (g *Gateway) handle(client net.Conn) {
 		return
 	}
 	g.handleProxy(client, clientIP, target)
+}
+
+func (g *Gateway) routeAction(target string) string {
+	router := g.router.Load()
+	if router == nil {
+		return routing.ActionProxy
+	}
+	return router.ActionFor(target)
 }
 
 func (g *Gateway) handleDirect(client net.Conn, clientIP string, target string) {
