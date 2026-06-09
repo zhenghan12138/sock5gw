@@ -21,6 +21,16 @@
     "upstream": "1.1.1.1:53",
     "blocked_qtypes": ["AAAA", "HTTPS", "SVCB"]
   },
+  "routing": {
+    "enabled": false,
+    "geosite_path": "/etc/sock5gw/geosite.dat",
+    "default_action": "proxy",
+    "rules": [
+      { "type": "geosite", "value": "geosite:cn", "action": "direct" },
+      { "type": "geosite", "value": "geosite:category-ads-all", "action": "block" },
+      { "type": "domain_suffix", "value": "example.com", "action": "proxy" }
+    ]
+  },
   "health_check": {
     "enabled": false,
     "interval": "30s",

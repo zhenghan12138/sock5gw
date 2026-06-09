@@ -14,6 +14,7 @@ import (
 
 	"sock5gw/internal/config"
 	"sock5gw/internal/manager"
+	"sock5gw/internal/routing"
 )
 
 type Manager interface {
@@ -24,12 +25,14 @@ type Manager interface {
 }
 
 type Gateway struct {
-	cfg config.Gateway
-	mgr Manager
+	cfg    config.Gateway
+	dns    config.DNS
+	mgr    Manager
+	router *routing.Matcher
 }
 
-func New(cfg config.Gateway, mgr Manager) *Gateway {
-	return &Gateway{cfg: cfg, mgr: mgr}
+func New(cfg config.Gateway, dns config.DNS, mgr Manager, router *routing.Matcher) *Gateway {
+	return &Gateway{cfg: cfg, dns: dns, mgr: mgr, router: router}
 }
 
 func (g *Gateway) Run(ctx context.Context) error {
@@ -71,6 +74,83 @@ func (g *Gateway) handle(client net.Conn) {
 		slog.Debug("blocked target", "client_ip", clientIP, "target", target)
 		return
 	}
+	switch g.router.ActionFor(target) {
+	case routing.ActionBlock:
+		slog.Debug("routing blocked target", "client_ip", clientIP, "target", target)
+		return
+	case routing.ActionDirect:
+		g.handleDirect(client, clientIP, target)
+		return
+	}
+	g.handleProxy(client, clientIP, target)
+}
+
+func (g *Gateway) handleDirect(client net.Conn, clientIP string, target string) {
+	upstream, err := g.dialDirect(context.Background(), target)
+	if err != nil {
+		slog.Warn("direct dial failed", "client_ip", clientIP, "target", target, "err", err)
+		return
+	}
+	defer upstream.Close()
+	relay(client, upstream, g.cfg.IdleTimeout.Duration)
+}
+
+func (g *Gateway) dialDirect(ctx context.Context, target string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return nil, err
+	}
+	dialer := net.Dialer{Timeout: g.cfg.DialTimeout.Duration}
+	if net.ParseIP(host) != nil {
+		return dialer.DialContext(ctx, "tcp", target)
+	}
+	ips, err := g.lookupDirect(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("no direct address")
+}
+
+func (g *Gateway) lookupDirect(ctx context.Context, host string) ([]net.IP, error) {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialer := net.Dialer{Timeout: g.cfg.DialTimeout.Duration}
+			upstream := g.dns.Upstream
+			if _, _, err := net.SplitHostPort(upstream); err != nil {
+				upstream = net.JoinHostPort(upstream, "53")
+			}
+			return dialer.DialContext(ctx, "udp", upstream)
+		},
+	}
+	addrs, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		if ip4 := addr.IP.To4(); ip4 != nil {
+			ips = append(ips, ip4)
+		}
+	}
+	if len(ips) == 0 {
+		return nil, errors.New("no A records")
+	}
+	return ips, nil
+}
+
+func (g *Gateway) handleProxy(client net.Conn, clientIP string, target string) {
 	proxy, err := g.mgr.ResolveProxy(clientIP)
 	if err != nil {
 		slog.Debug("client has no usable lease", "client_ip", clientIP, "err", err)

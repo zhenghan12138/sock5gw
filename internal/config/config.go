@@ -16,6 +16,7 @@ type Config struct {
 	API         API           `json:"api"`
 	Gateway     Gateway       `json:"gateway"`
 	DNS         DNS           `json:"dns"`
+	Routing     Routing       `json:"routing"`
 	Proxies     []ProxyConfig `json:"proxies"`
 }
 
@@ -40,6 +41,22 @@ type DNS struct {
 	FakeIPCIDR  string   `json:"fake_ip_cidr"`
 	Upstream    string   `json:"upstream"`
 	BlockedQTyp []string `json:"blocked_qtypes"`
+}
+
+type Routing struct {
+	Enabled       bool          `json:"enabled"`
+	GeositePath   string        `json:"geosite_path"`
+	DefaultAction string        `json:"default_action"`
+	DirectDomains []string      `json:"direct_domains"`
+	ProxyDomains  []string      `json:"proxy_domains"`
+	BlockDomains  []string      `json:"block_domains"`
+	Rules         []RoutingRule `json:"rules"`
+}
+
+type RoutingRule struct {
+	Type   string `json:"type"`
+	Value  string `json:"value"`
+	Action string `json:"action"`
 }
 
 type HealthCheck struct {
@@ -131,6 +148,9 @@ func (cfg *Config) setDefaults() {
 	if cfg.DNS.Upstream == "" {
 		cfg.DNS.Upstream = "1.1.1.1:53"
 	}
+	if cfg.Routing.DefaultAction == "" {
+		cfg.Routing.DefaultAction = "proxy"
+	}
 	if cfg.HealthCheck.Interval.Duration == 0 {
 		cfg.HealthCheck.Interval.Duration = 30 * time.Second
 	}
@@ -167,6 +187,14 @@ func (cfg *Config) validate() error {
 	if _, _, err := net.ParseCIDR(cfg.DNS.FakeIPCIDR); err != nil {
 		return fmt.Errorf("dns.fake_ip_cidr: %w", err)
 	}
+	if err := validateRoutingAction("routing.default_action", cfg.Routing.DefaultAction); err != nil {
+		return err
+	}
+	for i, rule := range cfg.Routing.Rules {
+		if err := validateRoutingAction(fmt.Sprintf("routing.rules[%d].action", i), rule.Action); err != nil {
+			return err
+		}
+	}
 	seen := map[string]bool{}
 	for _, p := range cfg.Proxies {
 		if p.ID == "" {
@@ -181,4 +209,13 @@ func (cfg *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+func validateRoutingAction(name string, action string) error {
+	switch action {
+	case "", "direct", "proxy", "block":
+		return nil
+	default:
+		return fmt.Errorf("%s must be direct, proxy, or block", name)
+	}
 }
