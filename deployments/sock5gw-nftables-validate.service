@@ -1,0 +1,17 @@
+[Unit]
+Description=Validate sock5gw nftables rules in an isolated network namespace
+Documentation=file:/etc/sock5gw/nftables.nft
+Before=sock5gw-nftables.service sock5gw.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/sock5gw-nftables-validate /etc/sock5gw/nftables.nft /etc/sock5gw/config.json
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RuntimeDirectory=sock5gw-nftables
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+CapabilityBoundingSet=CAP_NET_ADMIN

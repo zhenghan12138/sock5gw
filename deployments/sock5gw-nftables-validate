@@ -1,0 +1,364 @@
+#!/bin/sh
+
+set -eu
+
+rules_source=${1:-/etc/sock5gw/nftables.nft}
+config_source=${2:-/etc/sock5gw/config.json}
+nft_bin=${NFT_BIN:-/usr/sbin/nft}
+jq_bin=${JQ_BIN:-/usr/bin/jq}
+sha256_bin=${SHA256_BIN:-/usr/bin/sha256sum}
+flock_bin=${FLOCK_BIN:-/usr/bin/flock}
+runtime_dir=${RUNTIME_DIRECTORY:-/run/sock5gw-nftables}
+validation_path=$runtime_dir/validated.sha256
+validated_rules_path=$runtime_dir/validated.rules.nft
+validated_config_path=$runtime_dir/validated.config.json
+
+fail() {
+  echo "sock5gw-nftables-validate: $*" >&2
+  exit 78
+}
+
+file_hash() {
+  "$sha256_bin" "$1" | /usr/bin/awk '{print $1}'
+}
+
+config_endpoint_field() {
+  path=$1
+  field=$2
+  "$jq_bin" -er --arg path "$path" --arg field "$field" '
+    getpath($path | split(".")) |
+    select(type == "string") |
+    capture("^(?<host>\\[[^]]+\\]|[^:]+):(?<port>[0-9]+)$") |
+    select((.host | test("[[:space:]]")) | not) |
+    (.port | tonumber) as $port |
+    select($port >= 1 and $port <= 65535) |
+    if $field == "host" then .host else $port end
+  ' "$config_path"
+}
+
+validate_source_scope() {
+  "$jq_bin" -Rse '
+    gsub("#[^\n]*"; "") |
+    gsub("[[:space:]]+"; " ") |
+    ascii_downcase as $source |
+    (
+      $source |
+      test(
+        "(^|[ ;{}])(include|flush|add|create|insert|replace|delete|get|list|reset|rename|monitor|describe|import|export)([ ;{}]|$)"
+      ) |
+      not
+    ) and
+    (
+      $source |
+      gsub("\\bdestroy[[:space:]]+table[[:space:]]+inet[[:space:]]+sock5gw\\b"; "") |
+      gsub("\\btable[[:space:]]+inet[[:space:]]+sock5gw\\b"; "") |
+      test("(^|[ ;{}])(destroy|table)([ ;{}]|$)") |
+      not
+    )
+  ' "$rules_path" >/dev/null
+}
+
+verify_isolated_ruleset() {
+  ruleset_json=$("$nft_bin" --json list ruleset) ||
+    fail "could not read the isolated nft ruleset"
+
+  printf '%s\n' "$ruleset_json" |
+    "$jq_bin" -e \
+      --arg dns_host "$dns_host" \
+      --argjson dns_port "$dns_port" \
+      --arg gateway_host "$gateway_host" \
+      --argjson gateway_port "$gateway_port" '
+        def tables:
+          [.nftables[] | .table? | select(. != null)];
+
+        def chains:
+          [
+            .nftables[]
+            | .chain?
+            | select(.family == "inet" and .table == "sock5gw")
+          ];
+
+        def chain_named($name):
+          first(chains[] | select(.name == $name));
+
+        def rules_in($chain):
+          [
+            .nftables[]
+            | .rule?
+            | select(
+                .family == "inet" and
+                .table == "sock5gw" and
+                .chain == $chain
+              )
+          ];
+
+        def expr_kinds($rule):
+          [($rule.expr // [])[] | keys[0]];
+
+        def all_matches_are_equal($rule):
+          all(
+            ($rule.expr // [])[];
+            if has("match") then .match.op == "==" else true end
+          );
+
+        def one_iif($rule):
+          [
+            ($rule.expr // [])[].match?
+            | select((.left.meta.key // "") == "iifname" and .op == "==")
+            | .right
+          ] |
+          if length == 1 and (.[0] | type) == "string" and (.[0] | length) > 0
+          then .[0]
+          else null
+          end;
+
+        def one_ipv4_source($rule):
+          [
+            ($rule.expr // [])[].match?
+            | select(
+                (.left.payload.protocol // "") == "ip" and
+                (.left.payload.field // "") == "saddr" and
+                .op == "=="
+              )
+            | .right
+          ] |
+          if length == 1 then .[0] else null end;
+
+        def has_payload_match($rule; $protocol; $field; $value):
+          any(
+            ($rule.expr // [])[];
+            (.match.op // "") == "==" and
+            (.match.left.payload.protocol // "") == $protocol and
+            (.match.left.payload.field // "") == $field and
+            .match.right == $value
+          );
+
+        def has_meta_match($rule; $key; $value):
+          any(
+            ($rule.expr // [])[];
+            (.match.op // "") == "==" and
+            (.match.left.meta.key // "") == $key and
+            .match.right == $value
+          );
+
+        def has_fib_local_match($rule):
+          any(
+            ($rule.expr // [])[];
+            (.match.op // "") == "==" and
+            (.match.left.fib.result // "") == "type" and
+            ((.match.left.fib.flags // []) | index("daddr")) != null and
+            .match.right == "local"
+          );
+
+        def private_destination_set($rule):
+          first(
+            ($rule.expr // [])[].match?
+            | select(
+                .op == "==" and
+                (.left.payload.protocol // "") == "ip" and
+                (.left.payload.field // "") == "daddr" and
+                (.right.set? | type) == "array"
+              )
+            | .right.set
+          );
+
+        def has_prefix($set; $address; $length):
+          any(
+            ($set // [])[];
+            (.prefix.addr // "") == $address and
+            (.prefix.len // -1) == $length
+          );
+
+        def redirects_to($rule; $port):
+          any(
+            ($rule.expr // [])[];
+            (.redirect.port? // 0) == $port
+          );
+
+        def valid_chain($chain; $type; $hook; $priority):
+          $chain != null and
+          $chain.type == $type and
+          $chain.hook == $hook and
+          $chain.prio == $priority and
+          $chain.policy == "accept";
+
+        tables as $tables |
+        chains as $chains |
+        chain_named("prerouting") as $prerouting |
+        chain_named("forward") as $forward |
+        rules_in("prerouting") as $prerouting_rules |
+        rules_in("forward") as $forward_rules |
+
+        $prerouting_rules[0] as $gateway_return |
+        $prerouting_rules[1] as $dns_udp |
+        $prerouting_rules[2] as $dns_tcp |
+        $prerouting_rules[3] as $local_return |
+        $prerouting_rules[4] as $private_return |
+        $prerouting_rules[5] as $tcp_redirect |
+        $forward_rules[0] as $ipv4_drop |
+        $forward_rules[1] as $ipv6_drop |
+
+        one_iif($gateway_return) as $client_if |
+        one_ipv4_source($gateway_return) as $gateway_ipv4 |
+        one_ipv4_source($dns_udp) as $client_lan |
+        private_destination_set($private_return) as $private_set |
+
+        all(
+          .nftables[];
+          has("metainfo") or has("table") or has("chain") or has("rule")
+        ) and
+        ($tables | length) == 1 and
+        $tables[0].family == "inet" and
+        $tables[0].name == "sock5gw" and
+        ($chains | map(.name) | sort) == ["forward", "prerouting"] and
+        valid_chain($prerouting; "nat"; "prerouting"; -100) and
+        valid_chain($forward; "filter"; "forward"; 0) and
+
+        ($prerouting_rules | map(.comment)) == [
+          "sock5gw:gateway-return",
+          "sock5gw:dns-udp-redirect",
+          "sock5gw:dns-tcp-redirect",
+          "sock5gw:local-return",
+          "sock5gw:private-return",
+          "sock5gw:tcp-redirect"
+        ] and
+        ($forward_rules | map(.comment)) == [
+          "sock5gw:ipv4-fail-closed",
+          "sock5gw:ipv6-fail-closed"
+        ] and
+
+        $client_if != null and
+        ($gateway_ipv4 | type) == "string" and
+        ($gateway_ipv4 | test("^[0-9]+([.][0-9]+){3}$")) and
+        ($client_lan.prefix.addr | type) == "string" and
+        ($client_lan.prefix.len | type) == "number" and
+        ($dns_host == "0.0.0.0" or $dns_host == $gateway_ipv4) and
+        ($gateway_host == "0.0.0.0" or $gateway_host == $gateway_ipv4) and
+
+        all(
+          [
+            $gateway_return,
+            $dns_udp,
+            $dns_tcp,
+            $local_return,
+            $private_return,
+            $tcp_redirect,
+            $ipv4_drop,
+            $ipv6_drop
+          ][];
+          all_matches_are_equal(.) and one_iif(.) == $client_if
+        ) and
+
+        one_ipv4_source($dns_tcp) == $client_lan and
+        one_ipv4_source($local_return) == $client_lan and
+        one_ipv4_source($private_return) == $client_lan and
+        one_ipv4_source($tcp_redirect) == $client_lan and
+        one_ipv4_source($ipv4_drop) == $client_lan and
+
+        expr_kinds($gateway_return) == ["match", "match", "return"] and
+        expr_kinds($dns_udp) == ["match", "match", "match", "counter", "redirect"] and
+        expr_kinds($dns_tcp) == ["match", "match", "match", "counter", "redirect"] and
+        expr_kinds($local_return) == ["match", "match", "match", "counter", "return"] and
+        expr_kinds($private_return) == ["match", "match", "match", "counter", "return"] and
+        expr_kinds($tcp_redirect) == ["match", "match", "match", "counter", "redirect"] and
+        expr_kinds($ipv4_drop) == ["match", "match", "counter", "drop"] and
+        expr_kinds($ipv6_drop) == ["match", "match", "counter", "drop"] and
+
+        has_payload_match($dns_udp; "udp"; "dport"; 53) and
+        redirects_to($dns_udp; $dns_port) and
+        has_payload_match($dns_tcp; "tcp"; "dport"; 53) and
+        redirects_to($dns_tcp; $dns_port) and
+        has_fib_local_match($local_return) and
+        has_prefix($private_set; "0.0.0.0"; 8) and
+        has_prefix($private_set; "10.0.0.0"; 8) and
+        has_prefix($private_set; "127.0.0.0"; 8) and
+        has_prefix($private_set; "169.254.0.0"; 16) and
+        has_prefix($private_set; "172.16.0.0"; 12) and
+        has_prefix($private_set; "192.168.0.0"; 16) and
+        (
+          has_prefix($private_set; "224.0.0.0"; 3) or
+          (
+            has_prefix($private_set; "224.0.0.0"; 4) and
+            has_prefix($private_set; "240.0.0.0"; 4)
+          )
+        ) and
+        has_meta_match($tcp_redirect; "l4proto"; "tcp") and
+        redirects_to($tcp_redirect; $gateway_port) and
+        has_meta_match($ipv6_drop; "nfproto"; "ipv6")
+      ' >/dev/null
+}
+
+[ -x "$nft_bin" ] || fail "nft is not executable: $nft_bin"
+[ -x "$jq_bin" ] || fail "jq is not executable: $jq_bin"
+[ -x "$sha256_bin" ] || fail "sha256sum is not executable: $sha256_bin"
+[ -x "$flock_bin" ] || fail "flock is not executable: $flock_bin"
+[ -r "$rules_source" ] || fail "rules file is not readable: $rules_source"
+[ -r "$config_source" ] || fail "config file is not readable: $config_source"
+[ -d "$runtime_dir" ] ||
+  /usr/bin/install -d -o root -g root -m 0700 "$runtime_dir"
+
+exec 9>"$runtime_dir/apply.lock"
+"$flock_bin" -w 30 -x 9 ||
+  fail "timed out waiting for the nftables validation lock"
+
+rules_tmp=
+config_tmp=
+validation_tmp=
+cleanup() {
+  [ -z "${rules_tmp:-}" ] || /usr/bin/rm -f -- "$rules_tmp"
+  [ -z "${config_tmp:-}" ] || /usr/bin/rm -f -- "$config_tmp"
+  [ -z "${validation_tmp:-}" ] || /usr/bin/rm -f -- "$validation_tmp"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+rules_tmp=$(/usr/bin/mktemp "$runtime_dir/rules.XXXXXX")
+config_tmp=$(/usr/bin/mktemp "$runtime_dir/config.XXXXXX")
+validation_tmp=$(/usr/bin/mktemp "$runtime_dir/validated.XXXXXX")
+
+/usr/bin/rm -f -- "$validation_path"
+/usr/bin/install -o root -g root -m 0600 "$rules_source" "$rules_tmp"
+/usr/bin/install -o root -g root -m 0600 "$config_source" "$config_tmp"
+rules_path=$rules_tmp
+config_path=$config_tmp
+
+validate_source_scope ||
+  fail "rules file may only replace table inet sock5gw"
+
+"$jq_bin" -e '.gateway.transparent_proxy == true' "$config_path" >/dev/null ||
+  fail "gateway.transparent_proxy must be true"
+
+dns_host=$(config_endpoint_field "dns.listen" "host") ||
+  fail "dns.listen must be a valid host:port"
+dns_port=$(config_endpoint_field "dns.listen" "port") ||
+  fail "dns.listen must use a port between 1 and 65535"
+gateway_host=$(config_endpoint_field "gateway.listen" "host") ||
+  fail "gateway.listen must be a valid host:port"
+gateway_port=$(config_endpoint_field "gateway.listen" "port") ||
+  fail "gateway.listen must use a port between 1 and 65535"
+
+"$nft_bin" --check --file "$rules_path" ||
+  fail "nft validation failed for $rules_path"
+"$nft_bin" --file "$rules_path" ||
+  fail "could not load candidate rules in the isolated network namespace"
+verify_isolated_ruleset ||
+  fail "candidate rules failed isolated semantic verification"
+
+rules_hash=$(file_hash "$rules_path") ||
+  fail "could not hash $rules_path"
+config_hash=$(file_hash "$config_path") ||
+  fail "could not hash $config_path"
+[ "$(file_hash "$rules_source")" = "$rules_hash" ] ||
+  fail "rules changed while creating the validation snapshot"
+[ "$(file_hash "$config_source")" = "$config_hash" ] ||
+  fail "config changed while creating the validation snapshot"
+
+printf '%s %s\n' "$rules_hash" "$config_hash" >"$validation_tmp"
+/usr/bin/chmod 0600 "$validation_tmp"
+/usr/bin/mv -f -- "$rules_tmp" "$validated_rules_path"
+rules_tmp=
+/usr/bin/mv -f -- "$config_tmp" "$validated_config_path"
+config_tmp=
+/usr/bin/mv -f -- "$validation_tmp" "$validation_path"
+validation_tmp=
+trap - EXIT HUP INT TERM

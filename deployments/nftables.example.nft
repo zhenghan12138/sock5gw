@@ -1,28 +1,43 @@
 #!/usr/sbin/nft -f
 
+# Replace these values before installing this file as
+# /etc/sock5gw/nftables.nft.
+define client_if = "eth0"
+define client_lan = 192.168.1.0/24
+define gateway_ipv4 = 192.168.1.10
+define dns_port = 5353
+define gateway_port = 15001
+
+# `destroy` is idempotent. The delete and replacement below are committed as
+# one nft transaction, so invalid replacement rules leave the old table intact.
+destroy table inet sock5gw
+
 table inet sock5gw {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
 
-    # Replace 192.168.1.0/24 with the client LAN range.
-    # Replace 192.168.1.10 with the gateway host IP.
-    ip saddr 192.168.1.10 return
-    ip saddr 192.168.1.0/24 udp dport 53 redirect to :5353
-    ip saddr 192.168.1.0/24 tcp dport 53 redirect to :5353
+    iifname $client_if ip saddr $gateway_ipv4 return comment "sock5gw:gateway-return"
+    iifname $client_if ip saddr $client_lan udp dport 53 counter redirect to :$dns_port comment "sock5gw:dns-udp-redirect"
+    iifname $client_if ip saddr $client_lan tcp dport 53 counter redirect to :$dns_port comment "sock5gw:dns-tcp-redirect"
 
-    # Do not capture local/private destinations or the gateway management ports.
-    ip saddr 192.168.1.0/24 ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return
-    ip saddr 192.168.1.0/24 tcp dport { 8080, 15001, 5353 } return
+    # Do not capture traffic addressed to this host or private/local networks.
+    iifname $client_if ip saddr $client_lan fib daddr type local counter return comment "sock5gw:local-return"
+    iifname $client_if ip saddr $client_lan ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } counter return comment "sock5gw:private-return"
 
     # Redirect client TCP traffic to the transparent gateway listener.
-    ip saddr 192.168.1.0/24 meta l4proto tcp redirect to :15001
+    iifname $client_if ip saddr $client_lan meta l4proto tcp counter redirect to :$gateway_port comment "sock5gw:tcp-redirect"
   }
 
   chain forward {
-    type filter hook forward priority filter; policy drop;
+    type filter hook forward priority filter; policy accept;
 
-    # Prevent bypass. The gateway service creates outbound connections locally;
-    # forwarded client traffic should not be routed directly.
-    ip saddr 192.168.1.0/24 drop
+    # Prevent client bypass without changing forwarding policy for unrelated
+    # Docker, VPN, or routed traffic. sock5gw creates outbound connections
+    # locally, so successfully redirected traffic does not enter this chain.
+    iifname $client_if ip saddr $client_lan counter drop comment "sock5gw:ipv4-fail-closed"
+
+    # v1 only supports transparent IPv4 TCP. Block forwarded client IPv6 to
+    # prevent it from bypassing the gateway.
+    iifname $client_if meta nfproto ipv6 counter drop comment "sock5gw:ipv6-fail-closed"
   }
 }

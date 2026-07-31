@@ -1,0 +1,74 @@
+#!/bin/sh
+
+set -eu
+
+rules_source=${1:-/etc/sock5gw/nftables.nft}
+config_source=${2:-/etc/sock5gw/config.json}
+nft_bin=${NFT_BIN:-/usr/sbin/nft}
+sha256_bin=${SHA256_BIN:-/usr/bin/sha256sum}
+flock_bin=${FLOCK_BIN:-/usr/bin/flock}
+runtime_dir=${RUNTIME_DIRECTORY:-/run/sock5gw-nftables}
+validation_path=$runtime_dir/validated.sha256
+validated_rules_path=$runtime_dir/validated.rules.nft
+validated_config_path=$runtime_dir/validated.config.json
+
+fail() {
+  echo "sock5gw-nftables-apply: $*" >&2
+  exit 78
+}
+
+file_hash() {
+  "$sha256_bin" "$1" | /usr/bin/awk '{print $1}'
+}
+
+[ -x "$nft_bin" ] || fail "nft is not executable: $nft_bin"
+[ -x "$sha256_bin" ] || fail "sha256sum is not executable: $sha256_bin"
+[ -x "$flock_bin" ] || fail "flock is not executable: $flock_bin"
+[ -r "$rules_source" ] || fail "rules file is not readable: $rules_source"
+[ -r "$config_source" ] || fail "config file is not readable: $config_source"
+[ -d "$runtime_dir" ] || fail "runtime directory is missing: $runtime_dir"
+
+exec 9>"$runtime_dir/apply.lock"
+"$flock_bin" -w 30 -x 9 ||
+  fail "timed out waiting for the nftables apply lock"
+
+[ -r "$validation_path" ] ||
+  fail "no successful isolated validation is available"
+[ -r "$validated_rules_path" ] ||
+  fail "validated rules snapshot is missing"
+[ -r "$validated_config_path" ] ||
+  fail "validated config snapshot is missing"
+
+IFS=' ' read -r validated_rules_hash validated_config_hash extra <"$validation_path" ||
+  fail "could not read $validation_path"
+[ -n "$validated_rules_hash" ] && [ -n "$validated_config_hash" ] && [ -z "${extra:-}" ] ||
+  fail "invalid validation record: $validation_path"
+
+snapshot_rules_hash=$(file_hash "$validated_rules_path") ||
+  fail "could not hash $validated_rules_path"
+snapshot_config_hash=$(file_hash "$validated_config_path") ||
+  fail "could not hash $validated_config_path"
+[ "$snapshot_rules_hash" = "$validated_rules_hash" ] ||
+  fail "validated rules snapshot does not match its validation record"
+[ "$snapshot_config_hash" = "$validated_config_hash" ] ||
+  fail "validated config snapshot does not match its validation record"
+
+current_rules_hash=$(file_hash "$rules_source") ||
+  fail "could not hash $rules_source"
+current_config_hash=$(file_hash "$config_source") ||
+  fail "could not hash $config_source"
+[ "$current_rules_hash" = "$validated_rules_hash" ] ||
+  fail "rules changed after isolated validation"
+[ "$current_config_hash" = "$validated_config_hash" ] ||
+  fail "config changed after isolated validation"
+
+"$nft_bin" --check --file "$validated_rules_path" ||
+  fail "nft validation failed for the validated rules snapshot"
+
+"$nft_bin" --file "$validated_rules_path" ||
+  fail "nft failed to load the validated rules snapshot"
+
+[ "$(file_hash "$rules_source")" = "$validated_rules_hash" ] ||
+  fail "rules changed while applying the validated snapshot"
+[ "$(file_hash "$config_source")" = "$validated_config_hash" ] ||
+  fail "config changed while applying the validated snapshot"

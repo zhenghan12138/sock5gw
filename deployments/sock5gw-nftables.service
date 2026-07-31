@@ -1,0 +1,22 @@
+[Unit]
+Description=Load nftables rules for sock5gw
+Documentation=file:/etc/sock5gw/nftables.nft
+Before=sock5gw.service
+Requires=sock5gw-nftables-validate.service
+After=nftables.service sock5gw-nftables-validate.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/sock5gw-nftables-apply /etc/sock5gw/nftables.nft /etc/sock5gw/config.json
+RemainAfterExit=yes
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RuntimeDirectory=sock5gw-nftables
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
