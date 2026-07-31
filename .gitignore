@@ -1,4 +1,4 @@
-sock5gw
+/sock5gw
 *.db
 *.db-shm
 *.db-wal
@@ -6,3 +6,4 @@ sock5gw
 .DS_Store
 dist/
 bin/
+/docs/sock5gw-link-diagram.html
