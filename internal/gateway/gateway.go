@@ -19,8 +19,8 @@ import (
 )
 
 type Manager interface {
-	ResolveProxy(clientIP string) (*manager.Proxy, error)
-	RegisterConn(clientIP, proxyID string, conn net.Conn)
+	AcquireProxyConn(clientIP string, conn net.Conn) (*manager.Proxy, error)
+	ConnectProxy(ctx context.Context, proxy manager.Proxy, target string) (net.Conn, error)
 	UnregisterConn(clientIP, proxyID string, conn net.Conn)
 	FakeIPStore() *manager.FakeIPStore
 }
@@ -65,12 +65,16 @@ func (g *Gateway) Run(ctx context.Context) error {
 			}
 			return err
 		}
-		go g.handle(conn)
+		go g.handle(ctx, conn)
 	}
 }
 
-func (g *Gateway) handle(client net.Conn) {
+func (g *Gateway) handle(ctx context.Context, client net.Conn) {
 	defer client.Close()
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = client.Close()
+	})
+	defer stopClose()
 	clientIP := remoteIP(client.RemoteAddr())
 	if clientIP == "" {
 		return
@@ -90,10 +94,10 @@ func (g *Gateway) handle(client net.Conn) {
 		slog.Debug("routing blocked target", "client_ip", clientIP, "target", target)
 		return
 	case routing.ActionDirect:
-		g.handleDirect(client, clientIP, target)
+		g.handleDirect(ctx, client, clientIP, target)
 		return
 	}
-	g.handleProxy(client, clientIP, target)
+	g.handleProxy(ctx, client, clientIP, target)
 }
 
 func (g *Gateway) routeAction(target string) string {
@@ -104,8 +108,10 @@ func (g *Gateway) routeAction(target string) string {
 	return router.ActionFor(target)
 }
 
-func (g *Gateway) handleDirect(client net.Conn, clientIP string, target string) {
-	upstream, err := g.dialDirect(context.Background(), target)
+func (g *Gateway) handleDirect(ctx context.Context, client net.Conn, clientIP string, target string) {
+	dialCtx, cancel := context.WithTimeout(ctx, g.cfg.DialTimeout.Duration)
+	upstream, err := g.dialDirect(dialCtx, target)
+	cancel()
 	if err != nil {
 		slog.Warn("direct dial failed", "client_ip", clientIP, "target", target, "err", err)
 		return
@@ -169,27 +175,23 @@ func (g *Gateway) lookupDirect(ctx context.Context, host string) ([]net.IP, erro
 	return ips, nil
 }
 
-func (g *Gateway) handleProxy(client net.Conn, clientIP string, target string) {
-	proxy, err := g.mgr.ResolveProxy(clientIP)
+func (g *Gateway) handleProxy(ctx context.Context, client net.Conn, clientIP string, target string) {
+	proxy, err := g.mgr.AcquireProxyConn(clientIP, client)
 	if err != nil {
 		slog.Debug("client has no usable lease", "client_ip", clientIP, "err", err)
 		return
 	}
-	upstream, err := manager.DialProxy(context.Background(), *proxy, g.cfg.DialTimeout.Duration)
+	defer g.mgr.UnregisterConn(clientIP, proxy.ID, client)
+
+	dialCtx, cancel := context.WithTimeout(ctx, g.cfg.DialTimeout.Duration)
+	upstream, err := g.mgr.ConnectProxy(dialCtx, *proxy, target)
+	cancel()
 	if err != nil {
-		slog.Warn("proxy dial failed", "client_ip", clientIP, "proxy_id", proxy.ID, "err", err)
+		slog.Warn("proxy chain failed", "client_ip", clientIP, "proxy_id", proxy.ID, "target", target, "err", err)
 		return
 	}
 	defer upstream.Close()
-	_ = upstream.SetDeadline(time.Now().Add(g.cfg.DialTimeout.Duration))
-	if err := manager.ConnectSOCKS5(upstream, target, proxy.Username, proxy.Password); err != nil {
-		slog.Warn("socks connect failed", "client_ip", clientIP, "proxy_id", proxy.ID, "target", target, "err", err)
-		return
-	}
-	_ = upstream.SetDeadline(time.Time{})
 
-	g.mgr.RegisterConn(clientIP, proxy.ID, client)
-	defer g.mgr.UnregisterConn(clientIP, proxy.ID, client)
 	relay(client, upstream, g.cfg.IdleTimeout.Duration)
 }
 

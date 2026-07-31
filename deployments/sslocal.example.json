@@ -1,0 +1,15 @@
+{
+  "server": "ss.example.invalid",
+  "server_port": 8388,
+  "password": "replace-with-the-ss-server-password",
+  "method": "chacha20-ietf-poly1305",
+  "mode": "tcp_only",
+  "locals": [
+    {
+      "protocol": "socks",
+      "local_address": "127.0.0.1",
+      "local_port": 11080,
+      "socks5_auth_config_path": "/etc/sock5gw/sslocal-auth.json"
+    }
+  ]
+}

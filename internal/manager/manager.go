@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha1"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"sock5gw/internal/config"
+	"sock5gw/internal/outbound"
 	"sock5gw/internal/store"
 )
 
@@ -35,11 +35,26 @@ const (
 	ProxyDraining  = "draining"
 	ProxyUnhealthy = "unhealthy"
 	ProxyDisabled  = "disabled"
+
+	frontHalfOpenRetryDelay  = 100 * time.Millisecond
+	ambiguousQueueRetryDelay = 5 * time.Second
 )
 
 var ErrNoLease = errors.New("no active lease")
 
 type proxyProbeFunc func(context.Context, Proxy) (string, error)
+
+type ambiguousProbe struct {
+	proxyID string
+	address string
+	token   outbound.FrontToken
+	err     error
+}
+
+type pendingSnapshot struct {
+	new     bool
+	refresh bool
+}
 
 type Proxy struct {
 	ID               string `json:"id"`
@@ -108,25 +123,44 @@ type Manager struct {
 	cfg *config.Config
 	db  *store.DB
 
-	mu          sync.Mutex
-	proxies     map[string]*Proxy
-	proxyOrder  []string
-	leases      map[string]*LeaseView
-	pendingNew  []string
-	pendingRefs []string
-	conns       map[string]map[net.Conn]struct{}
-	fake        *FakeIPStore
-	probeProxy  proxyProbeFunc
-	queueActive bool
+	mu                sync.Mutex
+	assignmentGate    chan struct{}
+	proxies           map[string]*Proxy
+	proxyOrder        []string
+	leases            map[string]*LeaseView
+	pendingNew        []string
+	pendingRefs       []string
+	conns             map[string]map[net.Conn]struct{}
+	fake              *FakeIPStore
+	connector         *outbound.Connector
+	probeProxy        proxyProbeFunc
+	queueCtx          context.Context
+	queueCancel       context.CancelFunc
+	queueWG           sync.WaitGroup
+	queueActive       bool
+	queueRetry        bool
+	queueTimer        *time.Timer
+	queueEpoch        uint64
+	queueBackoffUntil time.Time
+	queueStopped      bool
 }
 
 func New(cfg *config.Config, db *store.DB) (*Manager, error) {
+	connector, err := outbound.New(cfg.FrontProxy, cfg.DNS.Upstream)
+	if err != nil {
+		return nil, err
+	}
+	queueCtx, queueCancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:     cfg,
-		db:      db,
-		proxies: map[string]*Proxy{},
-		leases:  map[string]*LeaseView{},
-		conns:   map[string]map[net.Conn]struct{}{},
+		cfg:            cfg,
+		db:             db,
+		assignmentGate: make(chan struct{}, 1),
+		proxies:        map[string]*Proxy{},
+		leases:         map[string]*LeaseView{},
+		conns:          map[string]map[net.Conn]struct{}{},
+		connector:      connector,
+		queueCtx:       queueCtx,
+		queueCancel:    queueCancel,
 	}
 	m.probeProxy = m.defaultProbeProxy
 	fake, err := NewFakeIPStore(cfg.DNS.FakeIPCIDR)
@@ -135,6 +169,9 @@ func New(cfg *config.Config, db *store.DB) (*Manager, error) {
 	}
 	m.fake = fake
 	for _, p := range cfg.Proxies {
+		if m.frontAddressConflict(p.Address) {
+			return nil, fmt.Errorf("proxy %s address must differ from front_proxy.address", p.ID)
+		}
 		if err := db.UpsertProxy(context.Background(), store.Proxy{
 			ID:       p.ID,
 			Address:  p.Address,
@@ -149,6 +186,9 @@ func New(cfg *config.Config, db *store.DB) (*Manager, error) {
 		return nil, err
 	}
 	for _, p := range storedProxies {
+		if m.frontAddressConflict(p.Address) {
+			return nil, fmt.Errorf("stored proxy %s address must differ from front_proxy.address", p.ID)
+		}
 		status := ProxyIdle
 		if p.Disabled {
 			status = ProxyDisabled
@@ -186,6 +226,12 @@ func New(cfg *config.Config, db *store.DB) (*Manager, error) {
 }
 
 func (m *Manager) Start(ctx context.Context) {
+	if done := ctx.Done(); done != nil {
+		go func() {
+			<-done
+			m.stopQueueProcessing()
+		}()
+	}
 	go m.expiryLoop(ctx)
 	if m.cfg.HealthCheck.Enabled {
 		go m.healthLoop(ctx)
@@ -197,25 +243,41 @@ func (m *Manager) FakeIPStore() *FakeIPStore {
 }
 
 func (m *Manager) Lease(clientIP string) Assignment {
-	return m.ensureLease(context.Background(), clientIP, false)
+	return m.LeaseContext(context.Background(), clientIP)
+}
+
+func (m *Manager) LeaseContext(ctx context.Context, clientIP string) Assignment {
+	return m.ensureLease(ctx, clientIP, false)
 }
 
 func (m *Manager) AdminLease(clientIP string) (Assignment, error) {
+	return m.AdminLeaseContext(context.Background(), clientIP)
+}
+
+func (m *Manager) AdminLeaseContext(ctx context.Context, clientIP string) (Assignment, error) {
 	if ip := net.ParseIP(clientIP); ip == nil || ip.To4() == nil {
 		return Assignment{}, errors.New("valid IPv4 client_ip is required")
 	}
-	return m.ensureLease(context.Background(), clientIP, false), nil
+	return m.ensureLease(ctx, clientIP, false), nil
 }
 
 func (m *Manager) AdminRefresh(clientIP string) (Assignment, error) {
+	return m.AdminRefreshContext(context.Background(), clientIP)
+}
+
+func (m *Manager) AdminRefreshContext(ctx context.Context, clientIP string) (Assignment, error) {
 	if ip := net.ParseIP(clientIP); ip == nil || ip.To4() == nil {
 		return Assignment{}, errors.New("valid IPv4 client_ip is required")
 	}
-	return m.ensureLease(context.Background(), clientIP, true), nil
+	return m.ensureLease(ctx, clientIP, true), nil
 }
 
 func (m *Manager) Refresh(clientIP string) Assignment {
-	return m.ensureLease(context.Background(), clientIP, true)
+	return m.RefreshContext(context.Background(), clientIP)
+}
+
+func (m *Manager) RefreshContext(ctx context.Context, clientIP string) Assignment {
+	return m.ensureLease(ctx, clientIP, true)
 }
 
 func (m *Manager) Current(clientIP string) Assignment {
@@ -234,7 +296,10 @@ func (m *Manager) Current(clientIP string) Assignment {
 	return Assignment{ClientIP: clientIP, Status: LeaseBlocked}
 }
 
-func (m *Manager) ResolveProxy(clientIP string) (*Proxy, error) {
+func (m *Manager) AcquireProxyConn(clientIP string, conn net.Conn) (*Proxy, error) {
+	if conn == nil {
+		return nil, errors.New("connection is required")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	l := m.leases[clientIP]
@@ -242,41 +307,53 @@ func (m *Manager) ResolveProxy(clientIP string) (*Proxy, error) {
 		return nil, ErrNoLease
 	}
 	p := m.proxies[l.ProxyID]
-	if p == nil || p.Status == ProxyUnhealthy {
+	if p == nil || p.Status != ProxyActive || p.ClientIP != clientIP {
 		return nil, ErrNoLease
 	}
+	if m.conns[clientIP] == nil {
+		m.conns[clientIP] = map[net.Conn]struct{}{}
+	}
+	if _, exists := m.conns[clientIP][conn]; exists {
+		return nil, errors.New("connection is already registered")
+	}
+	m.conns[clientIP][conn] = struct{}{}
+	p.ActiveConns++
 	cp := *p
 	return &cp, nil
 }
 
-func (m *Manager) RegisterConn(clientIP, proxyID string, conn net.Conn) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.conns[clientIP] == nil {
-		m.conns[clientIP] = map[net.Conn]struct{}{}
-	}
-	m.conns[clientIP][conn] = struct{}{}
-	if p := m.proxies[proxyID]; p != nil {
-		p.ActiveConns++
-	}
+func (m *Manager) ConnectProxy(ctx context.Context, p Proxy, target string) (net.Conn, error) {
+	return m.connector.Connect(ctx, outbound.Endpoint{
+		Address:  p.Address,
+		Username: p.Username,
+		Password: p.Password,
+	}, target)
 }
 
 func (m *Manager) UnregisterConn(clientIP, proxyID string, conn net.Conn) {
 	m.mu.Lock()
 	wakeQueue := false
+	registered := false
 	if set := m.conns[clientIP]; set != nil {
-		delete(set, conn)
+		if _, exists := set[conn]; exists {
+			delete(set, conn)
+			registered = true
+		}
 		if len(set) == 0 {
 			delete(m.conns, clientIP)
 		}
 	}
-	if p := m.proxies[proxyID]; p != nil && p.ActiveConns > 0 {
+	if p := m.proxies[proxyID]; registered && p != nil && p.ActiveConns > 0 {
 		p.ActiveConns--
 		if p.Status == ProxyDraining && p.ActiveConns == 0 {
-			p.Status = ProxyIdle
 			p.ClientIP = ""
 			p.DrainingFor = ""
-			wakeQueue = true
+			if p.Disabled {
+				p.Status = ProxyDisabled
+			} else {
+				p.Status = ProxyIdle
+				wakeQueue = true
+			}
 		}
 	}
 	m.mu.Unlock()
@@ -287,6 +364,12 @@ func (m *Manager) UnregisterConn(clientIP, proxyID string, conn net.Conn) {
 
 func (m *Manager) CloseClientConnections(clientIP string) {
 	m.mu.Lock()
+	toClose := m.connectionSnapshotLocked(clientIP)
+	m.mu.Unlock()
+	closeConnections(toClose)
+}
+
+func (m *Manager) connectionSnapshotLocked(clientIP string) []net.Conn {
 	var toClose []net.Conn
 	for ip, set := range m.conns {
 		if clientIP != "" && ip != clientIP {
@@ -296,13 +379,17 @@ func (m *Manager) CloseClientConnections(clientIP string) {
 			toClose = append(toClose, conn)
 		}
 	}
-	m.mu.Unlock()
+	return toClose
+}
+
+func closeConnections(toClose []net.Conn) {
 	for _, conn := range toClose {
 		_ = conn.Close()
 	}
 }
 
 func (m *Manager) Status() map[string]any {
+	frontStatus := m.connector.FrontStatus()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	proxies := make([]Proxy, 0, len(m.proxies))
@@ -321,6 +408,7 @@ func (m *Manager) Status() map[string]any {
 		"leases":          leases,
 		"pending_new":     append([]string(nil), m.pendingNew...),
 		"pending_refresh": append([]string(nil), m.pendingRefs...),
+		"front_proxy":     frontStatus,
 	}
 }
 
@@ -330,6 +418,9 @@ func (m *Manager) AddProxy(ctx context.Context, in ProxyInput) (*Proxy, error) {
 	}
 	if _, _, err := net.SplitHostPort(in.Address); err != nil {
 		return nil, fmt.Errorf("address: %w", err)
+	}
+	if m.frontAddressConflict(in.Address) {
+		return nil, errors.New("proxy address must differ from front_proxy.address")
 	}
 	m.mu.Lock()
 	if _, exists := m.proxies[in.ID]; exists {
@@ -404,7 +495,7 @@ func (m *Manager) ImportProxiesFromURL(ctx context.Context, rawURL string) Impor
 	if err != nil {
 		return ImportResult{Skipped: 1, Errors: []string{err.Error()}}
 	}
-	client := subscriptionHTTPClient()
+	client := subscriptionHTTPClient(m.cfg.DNS.Upstream)
 	resp, err := client.Do(req)
 	if err != nil {
 		return ImportResult{Skipped: 1, Errors: []string{err.Error()}}
@@ -420,7 +511,7 @@ func (m *Manager) ImportProxiesFromURL(ctx context.Context, rawURL string) Impor
 	return m.ImportProxyPayload(ctx, body)
 }
 
-func subscriptionHTTPClient() *http.Client {
+func subscriptionHTTPClient(upstream string) *http.Client {
 	dialer := &net.Dialer{
 		Timeout: 15 * time.Second,
 	}
@@ -433,7 +524,7 @@ func subscriptionHTTPClient() *http.Client {
 				if err != nil || net.ParseIP(host) != nil {
 					return dialer.DialContext(ctx, network, address)
 				}
-				ips, err := resolveAOverDoH(ctx, host)
+				ips, err := resolveA(ctx, host, upstream, 5*time.Second)
 				if err != nil {
 					return nil, err
 				}
@@ -454,49 +545,25 @@ func subscriptionHTTPClient() *http.Client {
 	}
 }
 
-func resolveAOverDoH(ctx context.Context, host string) ([]net.IP, error) {
-	endpoint := "https://cloudflare-dns.com/dns-query?name=" + url.QueryEscape(host) + "&type=A"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/dns-json")
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-				dialer := net.Dialer{Timeout: 5 * time.Second}
-				return dialer.DialContext(ctx, network, "1.1.1.1:443")
-			},
-			TLSClientConfig:       &tls.Config{ServerName: "cloudflare-dns.com", MinVersion: tls.VersionTLS12},
-			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second,
+func resolveA(ctx context.Context, host string, upstream string, timeout time.Duration) ([]net.IP, error) {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialer := net.Dialer{Timeout: timeout}
+			if _, _, err := net.SplitHostPort(upstream); err != nil {
+				upstream = net.JoinHostPort(upstream, "53")
+			}
+			return dialer.DialContext(ctx, "udp", upstream)
 		},
 	}
-	resp, err := client.Do(req)
+	addrs, err := resolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("doh returned HTTP %d", resp.StatusCode)
-	}
-	var payload struct {
-		Answer []struct {
-			Type int    `json:"type"`
-			Data string `json:"data"`
-		} `json:"Answer"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&payload); err != nil {
-		return nil, err
-	}
-	var ips []net.IP
-	for _, answer := range payload.Answer {
-		if answer.Type != 1 {
-			continue
-		}
-		if ip := net.ParseIP(answer.Data); ip != nil && ip.To4() != nil {
-			ips = append(ips, ip)
+	ips := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		if ip4 := addr.IP.To4(); ip4 != nil {
+			ips = append(ips, ip4)
 		}
 	}
 	if len(ips) == 0 {
@@ -505,7 +572,7 @@ func resolveAOverDoH(ctx context.Context, host string) ([]net.IP, error) {
 	return ips, nil
 }
 
-func DialProxy(ctx context.Context, p Proxy, timeout time.Duration) (net.Conn, error) {
+func DialProxy(ctx context.Context, p Proxy, upstream string, timeout time.Duration) (net.Conn, error) {
 	dialer := net.Dialer{Timeout: timeout}
 	host, port, err := net.SplitHostPort(p.Address)
 	if err != nil {
@@ -514,7 +581,7 @@ func DialProxy(ctx context.Context, p Proxy, timeout time.Duration) (net.Conn, e
 	if net.ParseIP(host) != nil {
 		return dialer.DialContext(ctx, "tcp", p.Address)
 	}
-	ips, err := resolveAOverDoH(ctx, host)
+	ips, err := resolveA(ctx, host, upstream, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -638,6 +705,9 @@ func (m *Manager) UpdateProxy(ctx context.Context, id string, in ProxyInput) (*P
 	if _, _, err := net.SplitHostPort(in.Address); err != nil {
 		return nil, fmt.Errorf("address: %w", err)
 	}
+	if m.frontAddressConflict(in.Address) {
+		return nil, errors.New("proxy address must differ from front_proxy.address")
+	}
 	m.mu.Lock()
 	p := m.proxies[id]
 	if p == nil {
@@ -713,12 +783,39 @@ func (m *Manager) Release(clientIP string) {
 }
 
 func (m *Manager) ensureLease(ctx context.Context, clientIP string, refresh bool) Assignment {
+	if ctx.Err() != nil {
+		return m.assignmentCanceled(clientIP)
+	}
+	if m.connector.FrontEnabled() {
+		select {
+		case m.assignmentGate <- struct{}{}:
+			if ctx.Err() != nil {
+				<-m.assignmentGate
+				return m.assignmentCanceled(clientIP)
+			}
+			defer func() { <-m.assignmentGate }()
+		case <-ctx.Done():
+			return m.assignmentCanceled(clientIP)
+		}
+	}
+	if assignment, deferred := m.frontBackoffAssignment(clientIP, refresh); deferred {
+		if assignment.Status == LeasePending {
+			m.processQueueAsync()
+		}
+		return assignment
+	}
+	pendingBefore := m.pendingSnapshot(clientIP)
+	var ambiguous []ambiguousProbe
 	for {
 		proxy, pending := m.reserveProxyForLease(ctx, clientIP, refresh)
 		if proxy == nil {
+			if len(ambiguous) > 0 {
+				m.resolveAmbiguousLeaseBatch(ctx, clientIP, ambiguous, pendingBefore)
+			}
 			return pending
 		}
 		exitIP, err := m.probeProxy(ctx, *proxy)
+		evidence, hasEvidence := m.frontEvidenceForProbeResult(proxy.Address, err)
 		m.mu.Lock()
 		current := m.proxies[proxy.ID]
 		if current == nil || current.Status != ProxyChecking || current.ClientIP != clientIP {
@@ -732,15 +829,393 @@ func (m *Manager) ensureLease(ctx context.Context, clientIP string, refresh bool
 			m.mu.Unlock()
 			continue
 		}
+		contextStopped := ctx.Err() != nil
+		failureScope := outbound.FailureScopeOf(err)
+		if contextStopped {
+			assignment := m.canceledProbeAssignmentLocked(current, ambiguous, clientIP, refresh)
+			m.mu.Unlock()
+			return assignment
+		}
+		sharedFailure := failureScope == outbound.FailureScopeShared
+		if sharedFailure {
+			assignment := m.deferCheckedProxyLocked(current, clientIP, refresh)
+			m.restoreAmbiguousProbesLocked(ambiguous, clientIP)
+			m.mu.Unlock()
+			m.processQueueAsync()
+			return assignment
+		}
+		if failureScope == outbound.FailureScopeAmbiguous {
+			token, _ := outbound.AmbiguousFailureToken(err)
+			ambiguous = append(ambiguous, ambiguousProbe{
+				proxyID: current.ID,
+				address: current.Address,
+				token:   token,
+				err:     err,
+			})
+			if distinctAmbiguousEndpoints(ambiguous) >= 2 {
+				pending := m.enqueuePendingLeaseLocked(ctx, clientIP, refresh)
+				m.mu.Unlock()
+				m.resolveAmbiguousLeaseBatch(ctx, clientIP, ambiguous, pendingBefore)
+				return pending
+			}
+			m.mu.Unlock()
+			continue
+		}
+		if len(ambiguous) > 0 && hasEvidence {
+			var validated []ambiguousProbe
+			ambiguous, validated = partitionAmbiguousProbesByEvidence(ambiguous, evidence)
+			m.markAmbiguousProbesFailedLocked(ctx, validated, clientIP)
+		}
 		if err != nil {
 			m.markProbeFailedLocked(ctx, current, err)
 			m.mu.Unlock()
 			continue
 		}
+		m.restoreAmbiguousProbesLocked(ambiguous, clientIP)
 		assignment := m.activateCheckedProxyLocked(ctx, current, clientIP, refresh, exitIP)
 		m.mu.Unlock()
 		return assignment
 	}
+}
+
+func (m *Manager) pendingSnapshot(clientIP string) pendingSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return pendingSnapshot{
+		new:     m.inQueueLocked(m.pendingNew, clientIP),
+		refresh: m.inQueueLocked(m.pendingRefs, clientIP),
+	}
+}
+
+func (m *Manager) canceledProbeAssignmentLocked(current *Proxy, probes []ambiguousProbe, clientIP string, refresh bool) Assignment {
+	if current != nil {
+		if current.Disabled {
+			current.Status = ProxyDisabled
+			current.ClientIP = ""
+			current.DrainingFor = ""
+		} else {
+			m.markProxyIdleLocked(current)
+		}
+	}
+	m.restoreAmbiguousProbesLocked(probes, clientIP)
+	if refresh {
+		if lease := m.leases[clientIP]; lease != nil && lease.Status == LeaseActive {
+			return Assignment{
+				ClientIP:  clientIP,
+				ProxyID:   lease.ProxyID,
+				Status:    LeasePending,
+				ExpiresAt: lease.ExpiresAt,
+			}
+		}
+	}
+	return Assignment{ClientIP: clientIP, Status: LeasePending}
+}
+
+func (m *Manager) frontBackoffAssignment(clientIP string, refresh bool) (Assignment, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.frontQueueRetryAfter() <= 0 {
+		return Assignment{}, false
+	}
+	if lease := m.leases[clientIP]; lease != nil && lease.Status == LeaseActive && time.Now().Before(lease.ExpiresAt) {
+		if !refresh {
+			return Assignment{
+				ClientIP:  clientIP,
+				ProxyID:   lease.ProxyID,
+				Status:    LeaseActive,
+				ExpiresAt: lease.ExpiresAt,
+			}, true
+		}
+		m.enqueueUniqueLocked(&m.pendingRefs, clientIP)
+		return Assignment{
+			ClientIP:  clientIP,
+			ProxyID:   lease.ProxyID,
+			Status:    LeasePending,
+			ExpiresAt: lease.ExpiresAt,
+		}, true
+	}
+	m.enqueueUniqueLocked(&m.pendingNew, clientIP)
+	return Assignment{ClientIP: clientIP, Status: LeasePending}, true
+}
+
+func (m *Manager) assignmentCanceled(clientIP string) Assignment {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if lease := m.leases[clientIP]; lease != nil && lease.Status == LeaseActive && time.Now().Before(lease.ExpiresAt) {
+		return Assignment{
+			ClientIP:  clientIP,
+			ProxyID:   lease.ProxyID,
+			Status:    LeaseActive,
+			ExpiresAt: lease.ExpiresAt,
+		}
+	}
+	return Assignment{ClientIP: clientIP, Status: LeasePending}
+}
+
+func (m *Manager) resolveAmbiguousLeaseBatch(ctx context.Context, clientIP string, probes []ambiguousProbe, pendingBefore pendingSnapshot) {
+	if ctx.Err() != nil {
+		m.mu.Lock()
+		m.restoreAmbiguousProbesLocked(probes, clientIP)
+		m.restorePendingSnapshotLocked(clientIP, pendingBefore)
+		m.mu.Unlock()
+		return
+	}
+	var evidenceResolved bool
+	probes, evidenceResolved = m.applyRecentCrossEvidence(ctx, clientIP, probes)
+	if len(probes) == 0 {
+		m.processQueueAsync()
+		return
+	}
+	if evidenceResolved {
+		m.mu.Lock()
+		m.deferQueueRetryLocked(ambiguousQueueRetryDelay)
+		m.restoreAmbiguousProbesLocked(probes, clientIP)
+		m.mu.Unlock()
+		m.processQueueAsync()
+		return
+	}
+
+	if candidate, ok := m.activeCrossValidationProxy(probes); ok {
+		_, err := m.probeProxy(ctx, candidate)
+		evidence, hasEvidence := m.frontEvidenceForProbeResult(candidate.Address, err)
+		if ctx.Err() != nil {
+			m.mu.Lock()
+			m.restoreAmbiguousProbesLocked(probes, clientIP)
+			m.restorePendingSnapshotLocked(clientIP, pendingBefore)
+			m.mu.Unlock()
+			return
+		}
+		switch outbound.FailureScopeOf(err) {
+		case outbound.FailureScopeShared:
+			m.mu.Lock()
+			m.restoreAmbiguousProbesLocked(probes, clientIP)
+			m.mu.Unlock()
+			m.processQueueAsync()
+			return
+		case outbound.FailureScopeAmbiguous:
+			if token, ok := outbound.AmbiguousFailureToken(err); ok {
+				probes = append(probes, ambiguousProbe{proxyID: candidate.ID, address: candidate.Address, token: token, err: err})
+			}
+		default:
+			if hasEvidence {
+				unresolved, validated := partitionAmbiguousProbesByEvidence(probes, evidence)
+				if len(validated) == 0 {
+					break
+				}
+				m.mu.Lock()
+				m.markAmbiguousProbesFailedLocked(ctx, validated, clientIP)
+				if len(unresolved) > 0 {
+					m.deferQueueRetryLocked(ambiguousQueueRetryDelay)
+				}
+				m.restoreAmbiguousProbesLocked(unresolved, clientIP)
+				m.mu.Unlock()
+				m.processQueueAsync()
+				return
+			}
+		}
+	}
+
+	probes, evidenceResolved = m.applyRecentCrossEvidence(ctx, clientIP, probes)
+	if len(probes) == 0 {
+		m.processQueueAsync()
+		return
+	}
+	if evidenceResolved {
+		m.mu.Lock()
+		m.deferQueueRetryLocked(ambiguousQueueRetryDelay)
+		m.restoreAmbiguousProbesLocked(probes, clientIP)
+		m.mu.Unlock()
+		m.processQueueAsync()
+		return
+	}
+	circuitOpened := false
+	if distinctAmbiguousEndpoints(probes) >= 2 {
+		if first, last, ok := ambiguousTokenRange(probes); ok {
+			circuitOpened = m.connector.RecordAmbiguousBatchFailure(first, last)
+		}
+	}
+	m.mu.Lock()
+	if !circuitOpened {
+		m.deferQueueRetryLocked(ambiguousQueueRetryDelay)
+	}
+	m.restoreAmbiguousProbesLocked(probes, clientIP)
+	m.mu.Unlock()
+	m.processQueueAsync()
+}
+
+func (m *Manager) applyRecentCrossEvidence(ctx context.Context, clientIP string, probes []ambiguousProbe) ([]ambiguousProbe, bool) {
+	evidence, ok := m.connector.RecentFrontEvidence()
+	if !ok {
+		return probes, false
+	}
+	unresolved, validated := partitionAmbiguousProbesByEvidence(probes, evidence)
+	if len(validated) == 0 {
+		return probes, false
+	}
+	m.mu.Lock()
+	m.markAmbiguousProbesFailedLocked(ctx, validated, clientIP)
+	m.mu.Unlock()
+	return unresolved, true
+}
+
+func (m *Manager) frontEvidenceForProbeResult(address string, err error) (outbound.FrontEvidence, bool) {
+	if outbound.FrontEstablished(err) {
+		var phaseErr *outbound.PhaseError
+		if errors.As(err, &phaseErr) && phaseErr.Token.Sequence != 0 {
+			return outbound.FrontEvidence{
+				ExitAddress: address,
+				Generation:  phaseErr.Token.Generation,
+				Sequence:    phaseErr.Token.Sequence,
+			}, true
+		}
+	}
+	if err != nil {
+		return outbound.FrontEvidence{}, false
+	}
+	evidence, ok := m.connector.RecentFrontEvidence()
+	if !ok || !sameEndpoint(evidence.ExitAddress, address) {
+		return outbound.FrontEvidence{}, false
+	}
+	return evidence, true
+}
+
+func partitionAmbiguousProbesByEvidence(probes []ambiguousProbe, evidence outbound.FrontEvidence) ([]ambiguousProbe, []ambiguousProbe) {
+	unresolved := make([]ambiguousProbe, 0, len(probes))
+	validated := make([]ambiguousProbe, 0, len(probes))
+	for _, probe := range probes {
+		if probe.token.Sequence == 0 ||
+			evidence.Generation != probe.token.Generation ||
+			evidence.Sequence <= probe.token.Sequence ||
+			sameEndpoint(evidence.ExitAddress, probe.address) {
+			unresolved = append(unresolved, probe)
+			continue
+		}
+		validated = append(validated, probe)
+	}
+	return unresolved, validated
+}
+
+func (m *Manager) activeCrossValidationProxy(probes []ambiguousProbe) (Proxy, bool) {
+	excluded := make(map[string]bool, len(probes))
+	for _, probe := range probes {
+		excluded[probe.proxyID] = true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range m.proxyOrder {
+		proxy := m.proxies[id]
+		if proxy == nil || excluded[id] || proxy.Disabled || ambiguousEndpoint(probes, proxy.Address) {
+			continue
+		}
+		if proxy.Status != ProxyActive && proxy.Status != ProxyDraining {
+			continue
+		}
+		return *proxy, true
+	}
+	return Proxy{}, false
+}
+
+func ambiguousEndpoint(probes []ambiguousProbe, address string) bool {
+	for _, probe := range probes {
+		if sameEndpoint(probe.address, address) {
+			return true
+		}
+	}
+	return false
+}
+
+func distinctAmbiguousEndpoints(probes []ambiguousProbe) int {
+	var addresses []string
+	for _, probe := range probes {
+		if probe.token.Sequence == 0 || ambiguousAddress(addresses, probe.address) {
+			continue
+		}
+		addresses = append(addresses, probe.address)
+	}
+	return len(addresses)
+}
+
+func ambiguousAddress(addresses []string, address string) bool {
+	for _, existing := range addresses {
+		if sameEndpoint(existing, address) {
+			return true
+		}
+	}
+	return false
+}
+
+func ambiguousTokenRange(probes []ambiguousProbe) (outbound.FrontToken, outbound.FrontToken, bool) {
+	var first outbound.FrontToken
+	var last outbound.FrontToken
+	for _, probe := range probes {
+		if probe.token.Sequence == 0 {
+			continue
+		}
+		if first.Sequence == 0 {
+			first = probe.token
+		}
+		last = probe.token
+	}
+	return first, last, first.Sequence != 0 && last.Sequence != 0
+}
+
+func (m *Manager) restoreAmbiguousProbesLocked(probes []ambiguousProbe, clientIP string) {
+	for _, probe := range probes {
+		proxy := m.proxies[probe.proxyID]
+		if proxy == nil || proxy.Status != ProxyChecking || proxy.ClientIP != clientIP {
+			continue
+		}
+		if proxy.Disabled {
+			proxy.Status = ProxyDisabled
+			proxy.ClientIP = ""
+			proxy.DrainingFor = ""
+			continue
+		}
+		m.markProxyIdleLocked(proxy)
+	}
+}
+
+func (m *Manager) restorePendingSnapshotLocked(clientIP string, before pendingSnapshot) {
+	if !before.new {
+		m.pendingNew = removeIP(m.pendingNew, clientIP)
+	}
+	if !before.refresh {
+		m.pendingRefs = removeIP(m.pendingRefs, clientIP)
+	}
+}
+
+func (m *Manager) markAmbiguousProbesFailedLocked(ctx context.Context, probes []ambiguousProbe, clientIP string) {
+	for _, probe := range probes {
+		proxy := m.proxies[probe.proxyID]
+		if proxy == nil || proxy.Status != ProxyChecking || proxy.ClientIP != clientIP {
+			continue
+		}
+		if proxy.Disabled {
+			proxy.Status = ProxyDisabled
+			proxy.ClientIP = ""
+			proxy.DrainingFor = ""
+			continue
+		}
+		m.markProbeFailedLocked(ctx, proxy, probe.err)
+	}
+}
+
+func (m *Manager) deferCheckedProxyLocked(proxy *Proxy, clientIP string, refresh bool) Assignment {
+	m.markProxyIdleLocked(proxy)
+	if refresh {
+		m.enqueueUniqueLocked(&m.pendingRefs, clientIP)
+		if lease := m.leases[clientIP]; lease != nil && lease.Status == LeaseActive {
+			return Assignment{
+				ClientIP:  clientIP,
+				ProxyID:   lease.ProxyID,
+				Status:    LeasePending,
+				ExpiresAt: lease.ExpiresAt,
+			}
+		}
+		return Assignment{ClientIP: clientIP, Status: LeasePending}
+	}
+	m.enqueueUniqueLocked(&m.pendingNew, clientIP)
+	return Assignment{ClientIP: clientIP, Status: LeasePending}
 }
 
 func (m *Manager) reserveProxyForLease(ctx context.Context, clientIP string, refresh bool) (*Proxy, Assignment) {
@@ -757,23 +1232,32 @@ func (m *Manager) reserveProxyForLease(ctx context.Context, clientIP string, ref
 	}
 	proxy := m.takeIdleProxyLocked()
 	if proxy == nil {
-		if refresh {
-			m.enqueueUniqueLocked(&m.pendingRefs, clientIP)
-			if l := m.leases[clientIP]; l != nil && l.Status == LeaseActive {
-				m.db.AddEvent(ctx, clientIP, "", "pending", fmt.Sprintf("refresh=%v", refresh))
-				return nil, Assignment{ClientIP: clientIP, ProxyID: l.ProxyID, Status: LeasePending, ExpiresAt: l.ExpiresAt}
-			}
-		} else {
-			m.enqueueUniqueLocked(&m.pendingNew, clientIP)
-		}
-		m.db.AddEvent(ctx, clientIP, "", "pending", fmt.Sprintf("refresh=%v", refresh))
-		return nil, Assignment{ClientIP: clientIP, Status: LeasePending}
+		return nil, m.enqueuePendingLeaseLocked(ctx, clientIP, refresh)
 	}
 	proxy.Status = ProxyChecking
 	proxy.ClientIP = clientIP
 	proxy.DrainingFor = ""
 	cp := *proxy
 	return &cp, Assignment{}
+}
+
+func (m *Manager) enqueuePendingLeaseLocked(ctx context.Context, clientIP string, refresh bool) Assignment {
+	if refresh {
+		m.enqueueUniqueLocked(&m.pendingRefs, clientIP)
+		if lease := m.leases[clientIP]; lease != nil && lease.Status == LeaseActive {
+			m.db.AddEvent(ctx, clientIP, "", "pending", "refresh=true")
+			return Assignment{
+				ClientIP:  clientIP,
+				ProxyID:   lease.ProxyID,
+				Status:    LeasePending,
+				ExpiresAt: lease.ExpiresAt,
+			}
+		}
+	} else {
+		m.enqueueUniqueLocked(&m.pendingNew, clientIP)
+	}
+	m.db.AddEvent(ctx, clientIP, "", "pending", fmt.Sprintf("refresh=%v", refresh))
+	return Assignment{ClientIP: clientIP, Status: LeasePending}
 }
 
 func (m *Manager) activateCheckedProxyLocked(ctx context.Context, proxy *Proxy, clientIP string, refresh bool, exitIP string) Assignment {
@@ -821,22 +1305,96 @@ func (m *Manager) markProbeFailedLocked(ctx context.Context, p *Proxy, err error
 
 func (m *Manager) processQueueAsync() {
 	m.mu.Lock()
-	if m.queueActive {
+	if m.queueStopped || m.queueActive || m.queueRetry {
+		m.mu.Unlock()
+		return
+	}
+	if !m.hasQueuedLocked() || !m.hasIdleProxyLocked() {
+		m.mu.Unlock()
+		return
+	}
+	if retryAfter := m.frontQueueRetryAfter(); retryAfter > 0 {
+		m.scheduleQueueRetryLocked(retryAfter)
 		m.mu.Unlock()
 		return
 	}
 	m.queueActive = true
+	m.queueWG.Add(1)
 	m.mu.Unlock()
 	go func() {
-		m.processQueues(context.Background())
+		defer m.queueWG.Done()
+		m.processQueues(m.queueCtx)
 		m.mu.Lock()
 		m.queueActive = false
-		shouldRestart := m.hasQueuedLocked() && m.hasIdleProxyLocked()
+		shouldRestart := !m.queueStopped && m.hasQueuedLocked() && m.hasIdleProxyLocked()
 		m.mu.Unlock()
 		if shouldRestart {
 			m.processQueueAsync()
 		}
 	}()
+}
+
+func (m *Manager) scheduleQueueRetryLocked(delay time.Duration) {
+	m.cancelQueueRetryLocked()
+	m.queueRetry = true
+	m.queueEpoch++
+	epoch := m.queueEpoch
+	m.queueTimer = time.AfterFunc(delay, func() {
+		m.mu.Lock()
+		if !m.queueRetry || epoch != m.queueEpoch {
+			m.mu.Unlock()
+			return
+		}
+		m.queueRetry = false
+		m.queueTimer = nil
+		shouldProcess := !m.queueStopped && m.hasQueuedLocked() && m.hasIdleProxyLocked()
+		m.mu.Unlock()
+		if shouldProcess {
+			m.processQueueAsync()
+		}
+	})
+}
+
+func (m *Manager) cancelQueueRetryLocked() {
+	if !m.queueRetry && m.queueTimer == nil {
+		return
+	}
+	m.queueEpoch++
+	if m.queueTimer != nil {
+		m.queueTimer.Stop()
+		m.queueTimer = nil
+	}
+	m.queueRetry = false
+}
+
+func (m *Manager) deferQueueRetryLocked(delay time.Duration) {
+	until := time.Now().Add(delay)
+	if until.After(m.queueBackoffUntil) {
+		m.queueBackoffUntil = until
+	}
+}
+
+func (m *Manager) stopQueueProcessing() {
+	m.mu.Lock()
+	m.queueStopped = true
+	m.cancelQueueRetryLocked()
+	m.queueCancel()
+	m.mu.Unlock()
+	m.queueWG.Wait()
+}
+
+func (m *Manager) frontQueueRetryAfter() time.Duration {
+	retryAfter := m.connector.FrontRetryAfter()
+	if localRetryAfter := time.Until(m.queueBackoffUntil); localRetryAfter > retryAfter {
+		retryAfter = localRetryAfter
+	}
+	if retryAfter > 0 {
+		return retryAfter
+	}
+	if m.connector.FrontStatus().Status == "half_open" {
+		return frontHalfOpenRetryDelay
+	}
+	return 0
 }
 
 func (m *Manager) processQueues(ctx context.Context) {
@@ -874,25 +1432,29 @@ func (m *Manager) nextQueuedClient() (string, bool, bool) {
 func (m *Manager) releaseLocked(ctx context.Context, clientIP string, closeConns bool) {
 	l := m.leases[clientIP]
 	if l == nil {
+		m.removeQueuedLocked(clientIP)
 		return
 	}
 	delete(m.leases, clientIP)
 	m.removeQueuedLocked(clientIP)
 	if p := m.proxies[l.ProxyID]; p != nil {
 		if !m.proxyHasActiveLeaseLocked(l.ProxyID) {
-			m.releaseProxyBindingLocked(p)
+			m.releaseProxyBindingLocked(p, clientIP)
 		}
 	}
 	for _, id := range m.proxyOrder {
 		p := m.proxies[id]
 		if p != nil && p.DrainingFor == clientIP {
-			m.releaseProxyBindingLocked(p)
+			m.releaseProxyBindingLocked(p, clientIP)
 		}
 	}
 	_ = m.db.DeleteLease(ctx, clientIP)
 	m.db.AddEvent(ctx, clientIP, l.ProxyID, "released", "")
 	if closeConns {
-		go m.CloseClientConnections(clientIP)
+		toClose := m.connectionSnapshotLocked(clientIP)
+		if len(toClose) > 0 {
+			go closeConnections(toClose)
+		}
 	}
 }
 
@@ -906,14 +1468,25 @@ func (m *Manager) markProxyIdleLocked(p *Proxy) {
 	p.Status = ProxyIdle
 }
 
-func (m *Manager) releaseProxyBindingLocked(p *Proxy) {
+func (m *Manager) releaseProxyBindingLocked(p *Proxy, clientIP string) {
 	if p == nil {
 		return
 	}
 	p.ClientIP = ""
+	if p.ActiveConns > 0 {
+		p.DrainingFor = clientIP
+		if p.Status != ProxyUnhealthy {
+			p.Status = ProxyDraining
+		}
+		return
+	}
 	p.DrainingFor = ""
-	p.ActiveConns = 0
-	if p.Status != ProxyUnhealthy {
+	if p.Status == ProxyUnhealthy {
+		return
+	}
+	if p.Disabled {
+		p.Status = ProxyDisabled
+	} else {
 		p.Status = ProxyIdle
 	}
 }
@@ -951,11 +1524,10 @@ func (m *Manager) defaultProbeProxy(ctx context.Context, p Proxy) (string, error
 	if timeout == 0 {
 		timeout = 5 * time.Second
 	}
-	if err := probeSOCKS(ctx, p, m.cfg.HealthCheck.TargetHost, m.cfg.HealthCheck.TargetPort, timeout); err != nil {
+	if err := m.probeSOCKS(ctx, p, m.cfg.HealthCheck.TargetHost, m.cfg.HealthCheck.TargetPort, timeout); err != nil {
 		return "", err
 	}
-	exitIP := probeExitIPAny(ctx, p, m.exitIPURLs(), timeout)
-	return exitIP, nil
+	return m.probeExitIPAny(ctx, p, m.exitIPURLs(), timeout)
 }
 
 func (m *Manager) clientViewsLocked() []ClientView {
@@ -1097,6 +1669,30 @@ func uniqueStrings(values []string) []string {
 	return out
 }
 
+func (m *Manager) frontAddressConflict(address string) bool {
+	if !m.connector.FrontEnabled() {
+		return false
+	}
+	return sameEndpoint(address, m.connector.FrontStatus().Address)
+}
+
+func sameEndpoint(left, right string) bool {
+	leftHost, leftPort, leftErr := net.SplitHostPort(left)
+	rightHost, rightPort, rightErr := net.SplitHostPort(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftHost = strings.TrimSuffix(strings.ToLower(leftHost), ".")
+	rightHost = strings.TrimSuffix(strings.ToLower(rightHost), ".")
+	if leftIP, rightIP := net.ParseIP(leftHost), net.ParseIP(rightHost); leftIP != nil && rightIP != nil {
+		leftHost = leftIP.String()
+		rightHost = rightIP.String()
+	}
+	leftPortNumber, leftErr := strconv.Atoi(leftPort)
+	rightPortNumber, rightErr := strconv.Atoi(rightPort)
+	return leftErr == nil && rightErr == nil && leftHost == rightHost && leftPortNumber == rightPortNumber
+}
+
 func (m *Manager) enqueueUniqueLocked(queue *[]string, clientIP string) {
 	for _, ip := range *queue {
 		if ip == clientIP {
@@ -1121,6 +1717,10 @@ func (m *Manager) inQueueLocked(queue []string, clientIP string) bool {
 func (m *Manager) removeQueuedLocked(clientIP string) {
 	m.pendingNew = removeIP(m.pendingNew, clientIP)
 	m.pendingRefs = removeIP(m.pendingRefs, clientIP)
+	if !m.hasQueuedLocked() {
+		m.queueBackoffUntil = time.Time{}
+		m.cancelQueueRetryLocked()
+	}
 }
 
 func removeIP(queue []string, clientIP string) []string {

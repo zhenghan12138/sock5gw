@@ -29,14 +29,14 @@ func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler 
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		writeJSON(w, m.Lease(clientIP(r, cfg.TrustProxy)))
+		writeJSON(w, m.LeaseContext(r.Context(), clientIP(r, cfg.TrustProxy)))
 	})
 	mux.HandleFunc("POST /v1/lease/refresh", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.ClientKey) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		writeJSON(w, m.Refresh(clientIP(r, cfg.TrustProxy)))
+		writeJSON(w, m.RefreshContext(r.Context(), clientIP(r, cfg.TrustProxy)))
 	})
 	mux.HandleFunc("GET /v1/lease", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.ClientKey) {
@@ -109,7 +109,7 @@ func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler 
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
-		assignment, err := m.AdminLease(strings.TrimSpace(in.ClientIP))
+		assignment, err := m.AdminLeaseContext(r.Context(), strings.TrimSpace(in.ClientIP))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -271,7 +271,7 @@ func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler 
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		assignment, err := m.AdminRefresh(strings.TrimSpace(r.PathValue("ip")))
+		assignment, err := m.AdminRefreshContext(r.Context(), strings.TrimSpace(r.PathValue("ip")))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return

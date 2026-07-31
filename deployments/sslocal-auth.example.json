@@ -1,0 +1,10 @@
+{
+  "password": {
+    "users": [
+      {
+        "user_name": "sock5gw",
+        "password": "replace-with-local-socks-password"
+      }
+    ]
+  }
+}

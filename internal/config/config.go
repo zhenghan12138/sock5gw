@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -15,9 +17,19 @@ type Config struct {
 	HealthCheck HealthCheck   `json:"health_check"`
 	API         API           `json:"api"`
 	Gateway     Gateway       `json:"gateway"`
+	FrontProxy  FrontProxy    `json:"front_proxy"`
 	DNS         DNS           `json:"dns"`
 	Routing     Routing       `json:"routing"`
 	Proxies     []ProxyConfig `json:"proxies"`
+}
+
+type FrontProxy struct {
+	Enabled  bool   `json:"enabled"`
+	Protocol string `json:"protocol"`
+	Address  string `json:"address"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	FailOpen bool   `json:"fail_open"`
 }
 
 type API struct {
@@ -139,6 +151,9 @@ func (cfg *Config) setDefaults() {
 	if cfg.Gateway.IdleTimeout.Duration == 0 {
 		cfg.Gateway.IdleTimeout.Duration = 2 * time.Minute
 	}
+	if cfg.FrontProxy.Enabled && cfg.FrontProxy.Protocol == "" {
+		cfg.FrontProxy.Protocol = "socks5"
+	}
 	if cfg.DNS.Listen == "" {
 		cfg.DNS.Listen = "0.0.0.0:5353"
 	}
@@ -187,6 +202,9 @@ func (cfg *Config) validate() error {
 	if _, _, err := net.ParseCIDR(cfg.DNS.FakeIPCIDR); err != nil {
 		return fmt.Errorf("dns.fake_ip_cidr: %w", err)
 	}
+	if err := validateFrontProxy(cfg.FrontProxy); err != nil {
+		return err
+	}
 	if err := validateRoutingAction("routing.default_action", cfg.Routing.DefaultAction); err != nil {
 		return err
 	}
@@ -207,6 +225,36 @@ func (cfg *Config) validate() error {
 		if _, _, err := net.SplitHostPort(p.Address); err != nil {
 			return fmt.Errorf("proxy %s address: %w", p.ID, err)
 		}
+	}
+	return nil
+}
+
+func validateFrontProxy(front FrontProxy) error {
+	if front.FailOpen {
+		return errors.New("front_proxy.fail_open must be false")
+	}
+	if !front.Enabled {
+		return nil
+	}
+	if front.Protocol != "socks5" {
+		return errors.New("front_proxy.protocol must be socks5")
+	}
+	host, portText, err := net.SplitHostPort(front.Address)
+	if err != nil {
+		return fmt.Errorf("front_proxy.address: %w", err)
+	}
+	if host == "" || strings.ContainsAny(host, " \t\r\n") {
+		return errors.New("front_proxy.address host is required and must not contain whitespace")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("front_proxy.address port must be an integer between 1 and 65535")
+	}
+	if len(front.Username) > 255 {
+		return errors.New("front_proxy.username must not exceed 255 bytes")
+	}
+	if len(front.Password) > 255 {
+		return errors.New("front_proxy.password must not exceed 255 bytes")
 	}
 	return nil
 }

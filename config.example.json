@@ -15,6 +15,14 @@
     "dial_timeout": "10s",
     "idle_timeout": "2m"
   },
+  "front_proxy": {
+    "enabled": false,
+    "protocol": "socks5",
+    "address": "127.0.0.1:11080",
+    "username": "",
+    "password": "",
+    "fail_open": false
+  },
   "dns": {
     "listen": "0.0.0.0:5353",
     "fake_ip_cidr": "198.18.0.0/15",

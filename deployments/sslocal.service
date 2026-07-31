@@ -1,0 +1,31 @@
+[Unit]
+Description=Shadowsocks local SOCKS5 sidecar for sock5gw
+Documentation=https://github.com/shadowsocks/shadowsocks-rust
+Wants=network-online.target
+After=network-online.target
+Before=sock5gw.service
+
+[Service]
+Type=exec
+User=sslocal
+Group=sslocal
+UMask=0077
+ExecStart=/usr/local/bin/sslocal -c /etc/sock5gw/sslocal.json
+ExecStartPost=/bin/bash -c 'for ((i=0; i<50; i++)); do if exec 3<>/dev/tcp/127.0.0.1/11080 2>/dev/null; then exec 3>&-; exec 3<&-; exit 0; fi; sleep 0.1; done; exit 1'
+TimeoutStartSec=10s
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

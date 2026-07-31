@@ -25,6 +25,41 @@ go build ./cmd/sock5gw
 
 Linux is required for transparent original-destination lookup.
 
+## Front Proxy (P0)
+
+The optional front proxy adds one SOCKS5 hop before every leased proxy on the
+`proxy` TCP path:
+
+```text
+sock5gw -> local SOCKS5 sidecar -> front transport -> leased SOCKS5 -> target
+```
+
+The recommended front transport is a maintained Shadowsocks implementation
+such as `shadowsocks-rust`. Run `sslocal` as a separate process listening on
+`127.0.0.1:11080`; sock5gw intentionally does not implement the Shadowsocks
+protocol or cryptography. This keeps transport updates and failures isolated
+from lease management.
+
+```json
+"front_proxy": {
+  "enabled": true,
+  "protocol": "socks5",
+  "address": "127.0.0.1:11080",
+  "username": "",
+  "password": "",
+  "fail_open": false
+}
+```
+
+The front proxy is fail closed. `fail_open: true` is rejected during config
+loading, and sock5gw never bypasses an unavailable sidecar. The management API
+remains available while proxied connections fail. `direct` routes remain
+direct. P0 covers TCP only; generic UDP/QUIC and the DNS upstream are outside
+this front-proxy path.
+
+See the [Chinese implementation plan](docs/front-proxy-p0-plan.md) and the
+[sslocal deployment guide](deployments/README.front-proxy.md).
+
 ## API
 
 Use bearer tokens from `config.json`.
@@ -91,17 +126,33 @@ curl -H 'Authorization: Bearer change-admin-token' \
    proxy pool, and LAN settings.
 3. Create `/var/lib/sock5gw`.
 4. Install `deployments/sock5gw.service`.
-5. Adapt `deployments/nftables.example.nft` to the client LAN CIDR and load it.
-6. Set clients' default gateway and DNS server to the Ubuntu host IP.
-7. Disable or block IPv6 in the client LAN for v1.
+5. Adapt `deployments/nftables.example.nft` to the client interface, LAN CIDR,
+   gateway address, and configured ports.
+6. Install `deployments/sock5gw-nftables.service` and
+   `deployments/sock5gw.service.d/nftables.conf`. The strong systemd dependency
+   prevents sock5gw from starting when the nft rules fail to load.
+7. Set clients' default gateway and DNS server to the Ubuntu host IP.
+8. Disable or block IPv6 in the client LAN for v1.
 
-Enable IPv4 forwarding:
+See `deployments/README.nftables.md` for installation, failure-injection,
+verification, and rollback commands.
+
+When enabling the front proxy, install the `sslocal` sidecar and its sock5gw
+systemd drop-in before restarting sock5gw. The deployment guide includes the
+required `0600` secret-file permissions.
+
+Transparent DNS/TCP redirects do not require kernel IPv4 forwarding. On a
+dedicated gateway, keep it disabled so a missing or flushed nft table cannot
+turn the host into a direct-routing bypass:
 
 ```sh
-sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv4.ip_forward=0
 ```
 
-Persist it in `/etc/sysctl.d/99-sock5gw.conf`.
+Only enable forwarding when the host intentionally routes excluded private
+networks, and install an independent host `FORWARD` baseline before connecting
+clients. See the nftables deployment guide for the first-install and ruleset
+loss boundary. Persist the chosen setting in `/etc/sysctl.d/99-sock5gw.conf`.
 
 ## Notes
 
