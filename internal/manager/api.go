@@ -3,11 +3,13 @@ package manager
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"html/template"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +17,21 @@ import (
 	"github.com/oschwald/geoip2-golang"
 
 	"sock5gw/internal/config"
+	"sock5gw/internal/outbound"
 )
+
+type frontProxyUpdateInput struct {
+	Enabled          bool   `json:"enabled"`
+	URL              string `json:"url"`
+	ClearCredentials bool   `json:"clear_credentials"`
+}
+
+type frontProxyView struct {
+	Enabled               bool                 `json:"enabled"`
+	URL                   string               `json:"url,omitempty"`
+	CredentialsConfigured bool                 `json:"credentials_configured"`
+	Status                outbound.FrontStatus `json:"status"`
+}
 
 func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler {
 	ipGeo := newIPGeoCache(cfg.GeoIPDBPath)
@@ -82,6 +98,49 @@ func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler 
 			return
 		}
 		writeJSON(w, runtimeCfg.Routing())
+	})
+	mux.HandleFunc("GET /v1/admin/front-proxy", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if runtimeCfg == nil {
+			http.Error(w, "runtime config unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, newFrontProxyView(runtimeCfg.FrontProxy(), m.FrontStatus()))
+	})
+	mux.HandleFunc("PUT /v1/admin/front-proxy", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if runtimeCfg == nil {
+			http.Error(w, "runtime config unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var in frontProxyUpdateInput
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		next, err := frontProxyFromInput(runtimeCfg.FrontProxy(), in)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := runtimeCfg.UpdateFrontProxy(next); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, newFrontProxyView(runtimeCfg.FrontProxy(), m.FrontStatus()))
+	})
+	mux.HandleFunc("POST /v1/admin/front-proxy/test", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		writeJSON(w, m.TestFrontProxy(r.Context()))
 	})
 	mux.HandleFunc("POST /v1/admin/ip-geo", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.AdminKey) {
@@ -281,6 +340,64 @@ func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler 
 	return mux
 }
 
+func frontProxyFromInput(current config.FrontProxy, in frontProxyUpdateInput) (config.FrontProxy, error) {
+	next := current
+	next.Enabled = in.Enabled
+	next.FailOpen = false
+	rawURL := strings.TrimSpace(in.URL)
+	if rawURL == "" {
+		if in.ClearCredentials {
+			next.Username = ""
+			next.Password = ""
+		}
+		if next.Enabled && strings.TrimSpace(next.Address) == "" {
+			return config.FrontProxy{}, errors.New("front proxy URL is required when enabled")
+		}
+		if next.Enabled && strings.TrimSpace(next.Protocol) == "" {
+			next.Protocol = "socks5"
+		}
+		return next, nil
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Opaque != "" {
+		return config.FrontProxy{}, errors.New("invalid front proxy URL")
+	}
+	if strings.ToLower(parsed.Scheme) != "socks5" {
+		return config.FrontProxy{}, errors.New("front proxy URL must use socks5://")
+	}
+	if parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return config.FrontProxy{}, errors.New("front proxy URL must not contain a path, query, or fragment")
+	}
+	host, port := parsed.Hostname(), parsed.Port()
+	if host == "" || port == "" {
+		return config.FrontProxy{}, errors.New("front proxy URL must include host and port")
+	}
+	next.Protocol = "socks5"
+	next.Address = net.JoinHostPort(host, port)
+	switch {
+	case parsed.User != nil:
+		next.Username = parsed.User.Username()
+		next.Password, _ = parsed.User.Password()
+	case in.ClearCredentials:
+		next.Username = ""
+		next.Password = ""
+	}
+	return next, nil
+}
+
+func newFrontProxyView(front config.FrontProxy, status outbound.FrontStatus) frontProxyView {
+	view := frontProxyView{
+		Enabled:               front.Enabled,
+		CredentialsConfigured: front.Username != "" || front.Password != "",
+		Status:                status,
+	}
+	if strings.TrimSpace(front.Address) != "" {
+		view.URL = "socks5://" + strings.TrimSpace(front.Address)
+	}
+	return view
+}
+
 var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -306,20 +423,29 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     th { color:var(--muted); font-weight:600; font-size:12px; background:#fafbfc; }
     tr:last-child td { border-bottom:0; }
     .pill { display:inline-flex; align-items:center; min-height:22px; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#1d4ed8; font-size:12px; }
-    .idle { background:#ecfdf3; color:var(--good); }
+    .idle,.healthy { background:#ecfdf3; color:var(--good); }
     .active { background:#eff8ff; color:#175cd3; }
-    .draining,.pending,.checking { background:#fffaeb; color:var(--warn); }
+    .draining,.pending,.checking,.unknown,.half-open { background:#fffaeb; color:var(--warn); }
     .unhealthy,.blocked { background:#fef3f2; color:var(--bad); }
     .disabled { background:#f2f4f7; color:#475467; }
     form { display:grid; grid-template-columns:1fr 1.2fr 1fr 1fr auto; gap:8px; padding:14px 16px; border-top:1px solid var(--line); }
-    input, textarea { border:1px solid var(--line); border-radius:6px; padding:8px 10px; min-width:0; font:inherit; }
+    input, textarea, select { border:1px solid var(--line); border-radius:6px; padding:8px 10px; min-width:0; font:inherit; background:#fff; color:var(--text); }
     input { height:34px; }
+    input[type="checkbox"] { width:16px; height:16px; padding:0; accent-color:var(--accent); }
     textarea { width:100%; min-height:150px; resize:vertical; }
     button { height:32px; border:1px solid var(--line); background:#fff; border-radius:6px; padding:0 10px; cursor:pointer; }
     button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
     button.danger { color:var(--bad); }
+    button:disabled { cursor:not-allowed; opacity:.6; }
     .token { width:320px; max-width:45vw; }
-    @media (max-width:900px) { .stats { grid-template-columns:repeat(2,1fr); } form { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } .token { max-width:none; width:100%; } table { font-size:12px; } }
+    .front-form { grid-template-columns:auto minmax(280px,1fr) auto auto; align-items:end; }
+    .front-toggle,.front-clear { min-height:34px; display:flex; align-items:center; gap:8px; white-space:nowrap; }
+    .front-actions { display:flex; gap:8px; align-items:center; }
+    .field { display:grid; gap:5px; color:var(--muted); font-size:12px; }
+    .field input { color:var(--text); font-size:14px; }
+    .config-meta { padding:11px 16px; border-top:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px 20px; align-items:center; }
+    .config-meta span:last-child { margin-left:auto; }
+    @media (max-width:900px) { .stats { grid-template-columns:repeat(2,1fr); } form,.front-form { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } .token { max-width:none; width:100%; } table { font-size:12px; } .config-meta span:last-child { width:100%; margin-left:0; } }
   </style>
 </head>
 <body>
@@ -335,6 +461,23 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       <div class="stat"><span class="muted">活跃连接</span><b id="connCount">0</b></div>
       <div class="stat"><span class="muted">等待队列</span><b id="queueCount">0</b></div>
     </div>
+    <section>
+      <div class="section-head">
+        <h2>前置代理</h2>
+        <span id="frontStatus" class="pill disabled">未启用</span>
+      </div>
+      <form id="frontProxyForm" class="front-form">
+        <label class="front-toggle"><input id="frontEnabled" type="checkbox"> 启用</label>
+        <label class="field"><span>SOCKS5 链接</span><input id="frontURL" type="url" placeholder="socks5://user:password@127.0.0.1:11080" autocomplete="off" spellcheck="false"></label>
+        <label class="front-clear"><input id="frontClearCredentials" type="checkbox"> 删除已保存认证</label>
+        <div class="front-actions"><button id="frontTest" type="button">检测连接</button><button id="frontSave" class="primary">保存配置</button></div>
+      </form>
+      <div class="config-meta muted">
+        <span id="frontCredentialState">认证设置：无（不发送账号密码）</span>
+        <span id="frontLastCheck">最近检测：-</span>
+        <span id="frontResult"></span>
+      </div>
+    </section>
     <section>
       <div class="section-head"><h2>在线客户端</h2><button onclick="load()">刷新</button></div>
       <table>
@@ -437,7 +580,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     }
     async function api(path, opts = {}) {
       const res = await fetch(path, { ...opts, headers: { ...auth(), ...(opts.headers || {}) } });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error((await res.text()).trim());
       if (res.status === 204) return null;
       return res.json();
     }
@@ -452,6 +595,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       document.getElementById('idleCount').textContent = proxies.filter(p => p.status === 'idle').length;
       document.getElementById('connCount').textContent = proxies.reduce((n,p) => n + (p.active_connections || 0), 0);
       document.getElementById('queueCount').textContent = (data.pending_new || []).length + (data.pending_refresh || []).length;
+      renderFrontStatus(data.front_proxy || {});
       const clientBody = document.getElementById('clients');
       clientBody.replaceChildren();
       clients.forEach(c => {
@@ -470,6 +614,69 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         clientBody.appendChild(tr);
       });
       renderProxyPage();
+    }
+    function renderFrontStatus(status) {
+      const el = document.getElementById('frontStatus');
+      const value = status.status || (status.enabled ? 'unknown' : 'disabled');
+      const labels = { disabled:'未启用', unknown:'尚未验证', healthy:'连接正常', unhealthy:'连接异常', half_open:'恢复检测中' };
+      el.className = 'pill ' + value.replaceAll('_', '-');
+      el.textContent = labels[value] || value;
+      document.getElementById('frontLastCheck').textContent = '最近检测：' + fmtTime(status.last_checked_at);
+      if (status.last_error) {
+        document.getElementById('frontResult').textContent = '状态详情：' + frontErrorText(status.last_error);
+      }
+    }
+    function frontErrorText(value) {
+      const messages = {
+        'front proxy dial failed':'无法连接前置代理',
+        'front proxy authentication failed':'前置代理认证失败',
+        'front proxy handshake failed':'前置代理 SOCKS5 握手失败',
+        'front proxy could not connect to exit':'前置代理无法连接当前出口',
+        'front proxy could not connect to any candidate exit':'前置代理无法连接任何可用出口'
+      };
+      return messages[value] || value;
+    }
+    function frontTestText(data) {
+      if (data.ok) return '检测通过：完整前置链路可用';
+      const messages = {
+        disabled:'前置代理未启用，无需检测',
+        no_exit:'无法检测：代理池中没有可用出口',
+        canceled:'检测已取消',
+        inconclusive:'无法确认：前置代理或当前出口不可达，请检查后再次检测'
+      };
+      if (data.code === 'unhealthy') return '检测失败：' + frontErrorText(data.status?.last_error || '前置链路不可用');
+      return messages[data.code] || '检测未完成';
+    }
+    function renderFrontConfig(data) {
+      document.getElementById('frontEnabled').checked = !!data.enabled;
+      document.getElementById('frontURL').value = data.url || '';
+      const clear = document.getElementById('frontClearCredentials');
+      clear.checked = false;
+      clear.disabled = !data.credentials_configured;
+      document.getElementById('frontCredentialState').textContent = data.credentials_configured ? '认证设置：已保存用户名/密码' : '认证设置：无（不发送账号密码）';
+      renderFrontStatus(data.status || {});
+    }
+    async function loadFrontProxy() {
+      const data = await api('/v1/admin/front-proxy');
+      renderFrontConfig(data);
+      if (data.enabled && (data.status?.status || 'unknown') === 'unknown') await testFrontProxy();
+    }
+    async function testFrontProxy() {
+      const result = document.getElementById('frontResult');
+      const button = document.getElementById('frontTest');
+      button.disabled = true;
+      result.textContent = '正在检测完整前置链路...';
+      try {
+        const data = await api('/v1/admin/front-proxy/test', { method:'POST', body:'{}' });
+        renderFrontStatus(data.status || {});
+        result.textContent = frontTestText(data);
+        return data;
+      } catch (err) {
+        result.textContent = '检测失败：' + err.message;
+        return null;
+      } finally {
+        button.disabled = false;
+      }
     }
     async function loadRouting() {
       routingConfig = await api('/v1/admin/routing');
@@ -605,6 +812,36 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         el.textContent = '保存失败：' + err.message;
       }
     });
+    document.getElementById('frontProxyForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const result = document.getElementById('frontResult');
+      const save = document.getElementById('frontSave');
+      save.disabled = true;
+      result.textContent = '保存中...';
+      try {
+        const next = await api('/v1/admin/front-proxy', {
+          method:'PUT',
+          body:JSON.stringify({
+            enabled:document.getElementById('frontEnabled').checked,
+            url:document.getElementById('frontURL').value.trim(),
+            clear_credentials:document.getElementById('frontClearCredentials').checked
+          })
+        });
+        renderFrontConfig(next);
+        if (next.enabled) {
+          result.textContent = '配置已保存，正在检测连接...';
+          await testFrontProxy();
+        } else {
+          result.textContent = '配置已保存，前置代理已停用';
+        }
+        load().catch(console.error);
+      } catch (err) {
+        result.textContent = '保存失败：' + err.message;
+      } finally {
+        save.disabled = false;
+      }
+    });
+    document.getElementById('frontTest').addEventListener('click', testFrontProxy);
     async function importProxies() {
       const text = document.getElementById('importText').value;
       const el = document.getElementById('importResult');
@@ -631,6 +868,9 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       }
     }
     load().catch(err => alert(err.message));
+    loadFrontProxy().catch(err => {
+      document.getElementById('frontResult').textContent = '加载失败：' + err.message;
+    });
     loadRouting().catch(console.error);
     setInterval(() => load().catch(console.error), 5000);
   </script>

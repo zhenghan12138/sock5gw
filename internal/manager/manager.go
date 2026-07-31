@@ -119,6 +119,12 @@ type BatchResult struct {
 	Errors  []string `json:"errors,omitempty"`
 }
 
+type FrontProxyTestResult struct {
+	OK     bool                 `json:"ok"`
+	Code   string               `json:"code"`
+	Status outbound.FrontStatus `json:"status"`
+}
+
 type Manager struct {
 	cfg *config.Config
 	db  *store.DB
@@ -132,6 +138,7 @@ type Manager struct {
 	pendingRefs       []string
 	conns             map[string]map[net.Conn]struct{}
 	fake              *FakeIPStore
+	connectorMu       sync.RWMutex
 	connector         *outbound.Connector
 	probeProxy        proxyProbeFunc
 	queueCtx          context.Context
@@ -323,7 +330,7 @@ func (m *Manager) AcquireProxyConn(clientIP string, conn net.Conn) (*Proxy, erro
 }
 
 func (m *Manager) ConnectProxy(ctx context.Context, p Proxy, target string) (net.Conn, error) {
-	return m.connector.Connect(ctx, outbound.Endpoint{
+	return m.outboundConnector().Connect(ctx, outbound.Endpoint{
 		Address:  p.Address,
 		Username: p.Username,
 		Password: p.Password,
@@ -389,7 +396,7 @@ func closeConnections(toClose []net.Conn) {
 }
 
 func (m *Manager) Status() map[string]any {
-	frontStatus := m.connector.FrontStatus()
+	frontStatus := m.outboundConnector().FrontStatus()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	proxies := make([]Proxy, 0, len(m.proxies))
@@ -423,6 +430,10 @@ func (m *Manager) AddProxy(ctx context.Context, in ProxyInput) (*Proxy, error) {
 		return nil, errors.New("proxy address must differ from front_proxy.address")
 	}
 	m.mu.Lock()
+	if m.frontAddressConflict(in.Address) {
+		m.mu.Unlock()
+		return nil, errors.New("proxy address must differ from front_proxy.address")
+	}
 	if _, exists := m.proxies[in.ID]; exists {
 		m.mu.Unlock()
 		return nil, errors.New("proxy already exists")
@@ -709,6 +720,10 @@ func (m *Manager) UpdateProxy(ctx context.Context, id string, in ProxyInput) (*P
 		return nil, errors.New("proxy address must differ from front_proxy.address")
 	}
 	m.mu.Lock()
+	if m.frontAddressConflict(in.Address) {
+		m.mu.Unlock()
+		return nil, errors.New("proxy address must differ from front_proxy.address")
+	}
 	p := m.proxies[id]
 	if p == nil {
 		m.mu.Unlock()
@@ -786,7 +801,7 @@ func (m *Manager) ensureLease(ctx context.Context, clientIP string, refresh bool
 	if ctx.Err() != nil {
 		return m.assignmentCanceled(clientIP)
 	}
-	if m.connector.FrontEnabled() {
+	if m.outboundConnector().FrontEnabled() {
 		select {
 		case m.assignmentGate <- struct{}{}:
 			if ctx.Err() != nil {
@@ -1031,7 +1046,7 @@ func (m *Manager) resolveAmbiguousLeaseBatch(ctx context.Context, clientIP strin
 	circuitOpened := false
 	if distinctAmbiguousEndpoints(probes) >= 2 {
 		if first, last, ok := ambiguousTokenRange(probes); ok {
-			circuitOpened = m.connector.RecordAmbiguousBatchFailure(first, last)
+			circuitOpened = m.outboundConnector().RecordAmbiguousBatchFailure(first, last)
 		}
 	}
 	m.mu.Lock()
@@ -1044,7 +1059,7 @@ func (m *Manager) resolveAmbiguousLeaseBatch(ctx context.Context, clientIP strin
 }
 
 func (m *Manager) applyRecentCrossEvidence(ctx context.Context, clientIP string, probes []ambiguousProbe) ([]ambiguousProbe, bool) {
-	evidence, ok := m.connector.RecentFrontEvidence()
+	evidence, ok := m.outboundConnector().RecentFrontEvidence()
 	if !ok {
 		return probes, false
 	}
@@ -1072,7 +1087,7 @@ func (m *Manager) frontEvidenceForProbeResult(address string, err error) (outbou
 	if err != nil {
 		return outbound.FrontEvidence{}, false
 	}
-	evidence, ok := m.connector.RecentFrontEvidence()
+	evidence, ok := m.outboundConnector().RecentFrontEvidence()
 	if !ok || !sameEndpoint(evidence.ExitAddress, address) {
 		return outbound.FrontEvidence{}, false
 	}
@@ -1384,14 +1399,15 @@ func (m *Manager) stopQueueProcessing() {
 }
 
 func (m *Manager) frontQueueRetryAfter() time.Duration {
-	retryAfter := m.connector.FrontRetryAfter()
+	connector := m.outboundConnector()
+	retryAfter := connector.FrontRetryAfter()
 	if localRetryAfter := time.Until(m.queueBackoffUntil); localRetryAfter > retryAfter {
 		retryAfter = localRetryAfter
 	}
 	if retryAfter > 0 {
 		return retryAfter
 	}
-	if m.connector.FrontStatus().Status == "half_open" {
+	if connector.FrontStatus().Status == "half_open" {
 		return frontHalfOpenRetryDelay
 	}
 	return 0
@@ -1669,11 +1685,142 @@ func uniqueStrings(values []string) []string {
 	return out
 }
 
+func (m *Manager) outboundConnector() *outbound.Connector {
+	m.connectorMu.RLock()
+	defer m.connectorMu.RUnlock()
+	return m.connector
+}
+
+func (m *Manager) FrontStatus() outbound.FrontStatus {
+	return m.outboundConnector().FrontStatus()
+}
+
+func (m *Manager) TestFrontProxy(ctx context.Context) FrontProxyTestResult {
+	connector := m.outboundConnector()
+	status := connector.FrontStatus()
+	if !status.Enabled {
+		return FrontProxyTestResult{Code: "disabled", Status: status}
+	}
+
+	m.mu.Lock()
+	candidates := make([]Proxy, 0, 2)
+	for _, id := range m.proxyOrder {
+		proxy := m.proxies[id]
+		if proxy == nil || proxy.Disabled || proxy.Status == ProxyDisabled {
+			continue
+		}
+		duplicate := false
+		for _, candidate := range candidates {
+			if sameEndpoint(candidate.Address, proxy.Address) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		candidates = append(candidates, *proxy)
+		if len(candidates) == 2 {
+			break
+		}
+	}
+	m.mu.Unlock()
+	if len(candidates) == 0 {
+		return FrontProxyTestResult{Code: "no_exit", Status: status}
+	}
+
+	timeout := m.cfg.HealthCheck.Timeout.Duration
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	target := net.JoinHostPort(m.cfg.HealthCheck.TargetHost, strconv.Itoa(m.cfg.HealthCheck.TargetPort))
+	var ambiguous []outbound.FrontToken
+	for _, proxy := range candidates {
+		probeCtx, cancel := context.WithTimeout(ctx, timeout)
+		conn, err := connector.Connect(probeCtx, outbound.Endpoint{
+			Address:  proxy.Address,
+			Username: proxy.Username,
+			Password: proxy.Password,
+		}, target)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		cancel()
+
+		status = connector.FrontStatus()
+		if err == nil || outbound.FrontEstablished(err) || status.Status == "healthy" {
+			return FrontProxyTestResult{OK: true, Code: "healthy", Status: status}
+		}
+		if ctx.Err() != nil {
+			return FrontProxyTestResult{Code: "canceled", Status: status}
+		}
+		switch outbound.FailureScopeOf(err) {
+		case outbound.FailureScopeShared:
+			return FrontProxyTestResult{Code: "unhealthy", Status: status}
+		case outbound.FailureScopeAmbiguous:
+			if token, ok := outbound.AmbiguousFailureToken(err); ok {
+				ambiguous = append(ambiguous, token)
+			}
+		}
+	}
+	if len(ambiguous) >= 2 {
+		connector.RecordAmbiguousBatchFailure(ambiguous[0], ambiguous[len(ambiguous)-1])
+	}
+	status = connector.FrontStatus()
+	if status.Status == "unhealthy" {
+		return FrontProxyTestResult{Code: "unhealthy", Status: status}
+	}
+	return FrontProxyTestResult{Code: "inconclusive", Status: status}
+}
+
+// UpdateFrontProxy persists and activates a new connector for future
+// connections. Connections that already hold the previous connector continue
+// uninterrupted.
+func (m *Manager) UpdateFrontProxy(next config.FrontProxy, persist func() error) error {
+	next.Protocol = strings.ToLower(strings.TrimSpace(next.Protocol))
+	next.Address = strings.TrimSpace(next.Address)
+	if next.Enabled && next.Protocol == "" {
+		next.Protocol = "socks5"
+	}
+	candidate, err := outbound.New(next, m.cfg.DNS.Upstream)
+	if err != nil {
+		return err
+	}
+	if persist == nil {
+		return errors.New("front proxy persistence is unavailable")
+	}
+
+	m.mu.Lock()
+	if next.Enabled {
+		for _, proxy := range m.proxies {
+			if proxy != nil && sameEndpoint(proxy.Address, next.Address) {
+				m.mu.Unlock()
+				return errors.New("front proxy address must differ from every proxy address")
+			}
+		}
+	}
+	if err := persist(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	m.connectorMu.Lock()
+	m.connector = candidate
+	m.connectorMu.Unlock()
+	m.cfg.FrontProxy = next
+	m.queueBackoffUntil = time.Time{}
+	m.cancelQueueRetryLocked()
+	m.mu.Unlock()
+
+	m.processQueueAsync()
+	return nil
+}
+
 func (m *Manager) frontAddressConflict(address string) bool {
-	if !m.connector.FrontEnabled() {
+	connector := m.outboundConnector()
+	if !connector.FrontEnabled() {
 		return false
 	}
-	return sameEndpoint(address, m.connector.FrontStatus().Address)
+	return sameEndpoint(address, connector.FrontStatus().Address)
 }
 
 func sameEndpoint(left, right string) bool {

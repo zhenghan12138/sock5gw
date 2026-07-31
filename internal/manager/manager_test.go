@@ -1214,6 +1214,40 @@ func TestFrontAddressCannotBeUsedAsExit(t *testing.T) {
 	}
 }
 
+func TestFrontProxyTestReportsDisabledAndMissingExit(t *testing.T) {
+	disabled := testManager(t, 1).TestFrontProxy(context.Background())
+	if disabled.OK || disabled.Code != "disabled" || disabled.Status.Status != "disabled" {
+		t.Fatalf("disabled test result = %+v", disabled)
+	}
+
+	cfg := testConfig(0)
+	cfg.FrontProxy = config.FrontProxy{Enabled: true, Protocol: "socks5", Address: "127.0.0.1:11080"}
+	noExit := testManagerFromConfig(t, cfg).TestFrontProxy(context.Background())
+	if noExit.OK || noExit.Code != "no_exit" || noExit.Status.Status != "unknown" {
+		t.Fatalf("no-exit test result = %+v", noExit)
+	}
+}
+
+func TestFrontProxyTestReportsSharedFailure(t *testing.T) {
+	frontAddress, accepts := rejectingFrontProxy(t)
+	cfg := testConfig(1)
+	cfg.FrontProxy = config.FrontProxy{Enabled: true, Protocol: "socks5", Address: frontAddress}
+	manager := testManagerFromConfig(t, cfg)
+	result := manager.TestFrontProxy(context.Background())
+	if result.OK || result.Code != "unhealthy" || result.Status.Status != "unhealthy" {
+		t.Fatalf("front test result = %+v", result)
+	}
+	if result.Status.LastError == "" {
+		t.Fatalf("front test did not expose a public error: %+v", result)
+	}
+	if got := accepts.Load(); got != 1 {
+		t.Fatalf("front accepts = %d, want 1", got)
+	}
+	if proxy := manager.proxies["a"]; proxy.Status != ProxyIdle || proxy.FailureCount != 0 {
+		t.Fatalf("front test changed exit health: %+v", proxy)
+	}
+}
+
 func TestNewRejectsSeedProxyAtFrontAddress(t *testing.T) {
 	const frontAddress = "127.0.0.1:11080"
 	cfg := testConfig(0)

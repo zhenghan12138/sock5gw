@@ -55,7 +55,7 @@ func (m *Manager) checkAll(ctx context.Context) {
 	}
 	m.mu.Unlock()
 	var preflightAmbiguous *healthResult
-	if m.connector.FrontEnabled() {
+	if m.outboundConnector().FrontEnabled() {
 		for _, proxy := range proxies {
 			current, ok := m.proxyCheckSnapshot(proxy.ID)
 			if !ok {
@@ -158,7 +158,7 @@ func (m *Manager) checkAll(ctx context.Context) {
 			causalEvidenceSet = append(causalEvidenceSet, causalEvidence{address: result.address, token: phaseErr.Token})
 		}
 	}
-	if evidence, ok := m.connector.RecentFrontEvidence(); ok && evidence.Sequence != 0 {
+	if evidence, ok := m.outboundConnector().RecentFrontEvidence(); ok && evidence.Sequence != 0 {
 		causalEvidenceSet = append(causalEvidenceSet, causalEvidence{
 			address: evidence.ExitAddress,
 			token:   outbound.FrontToken{Generation: evidence.Generation, Sequence: evidence.Sequence},
@@ -250,7 +250,7 @@ func (m *Manager) recordAmbiguousHealthBatch(ctx context.Context, first, last ou
 	if ctx.Err() != nil {
 		return
 	}
-	m.connector.RecordAmbiguousBatchFailure(first, last)
+	m.outboundConnector().RecordAmbiguousBatchFailure(first, last)
 }
 
 func (m *Manager) recordHealth(ctx context.Context, proxyID string, err error, exitIP string) {

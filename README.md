@@ -98,6 +98,8 @@ The page shows:
   current exit IP;
 - proxy pool status, health details, assigned client, active connections, and
   detected exit IP;
+- front SOCKS5 URL, credential presence, health status, and runtime enable or
+  disable controls;
 - add/delete proxies;
 - enable/disable proxies without restarting the service.
 
@@ -117,6 +119,18 @@ curl -H 'Authorization: Bearer change-admin-token' \
   -H 'Content-Type: application/json' \
   -d '{"disabled":true}' \
   -X POST http://GATEWAY_IP:8080/v1/admin/proxies/proxy-002/disabled
+```
+
+Front proxy updates are persisted to the JSON config and apply to new
+connections immediately. Existing connections are not interrupted. The API
+never returns the saved username or password; omitting user info from a new URL
+retains saved credentials unless `clear_credentials` is true.
+
+```sh
+curl -H 'Authorization: Bearer change-admin-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"url":"socks5://user:password@127.0.0.1:11080"}' \
+  -X PUT http://GATEWAY_IP:8080/v1/admin/front-proxy
 ```
 
 ## Ubuntu Deployment Sketch
