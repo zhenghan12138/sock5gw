@@ -1702,75 +1702,25 @@ func (m *Manager) TestFrontProxy(ctx context.Context) FrontProxyTestResult {
 		return FrontProxyTestResult{Code: "disabled", Status: status}
 	}
 
-	m.mu.Lock()
-	candidates := make([]Proxy, 0, 2)
-	for _, id := range m.proxyOrder {
-		proxy := m.proxies[id]
-		if proxy == nil || proxy.Disabled || proxy.Status == ProxyDisabled {
-			continue
-		}
-		duplicate := false
-		for _, candidate := range candidates {
-			if sameEndpoint(candidate.Address, proxy.Address) {
-				duplicate = true
-				break
-			}
-		}
-		if duplicate {
-			continue
-		}
-		candidates = append(candidates, *proxy)
-		if len(candidates) == 2 {
-			break
-		}
-	}
-	m.mu.Unlock()
-	if len(candidates) == 0 {
-		return FrontProxyTestResult{Code: "no_exit", Status: status}
-	}
-
 	timeout := m.cfg.HealthCheck.Timeout.Duration
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	target := net.JoinHostPort(m.cfg.HealthCheck.TargetHost, strconv.Itoa(m.cfg.HealthCheck.TargetPort))
-	var ambiguous []outbound.FrontToken
-	for _, proxy := range candidates {
-		probeCtx, cancel := context.WithTimeout(ctx, timeout)
-		conn, err := connector.Connect(probeCtx, outbound.Endpoint{
-			Address:  proxy.Address,
-			Username: proxy.Username,
-			Password: proxy.Password,
-		}, target)
-		if conn != nil {
-			_ = conn.Close()
-		}
-		cancel()
-
-		status = connector.FrontStatus()
-		if err == nil || outbound.FrontEstablished(err) || status.Status == "healthy" {
-			return FrontProxyTestResult{OK: true, Code: "healthy", Status: status}
-		}
-		if ctx.Err() != nil {
-			return FrontProxyTestResult{Code: "canceled", Status: status}
-		}
-		switch outbound.FailureScopeOf(err) {
-		case outbound.FailureScopeShared:
-			return FrontProxyTestResult{Code: "unhealthy", Status: status}
-		case outbound.FailureScopeAmbiguous:
-			if token, ok := outbound.AmbiguousFailureToken(err); ok {
-				ambiguous = append(ambiguous, token)
-			}
-		}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	conn, err := connector.ConnectFront(probeCtx, target)
+	if conn != nil {
+		_ = conn.Close()
 	}
-	if len(ambiguous) >= 2 {
-		connector.RecordAmbiguousBatchFailure(ambiguous[0], ambiguous[len(ambiguous)-1])
-	}
+	cancel()
 	status = connector.FrontStatus()
-	if status.Status == "unhealthy" {
-		return FrontProxyTestResult{Code: "unhealthy", Status: status}
+	if err == nil {
+		return FrontProxyTestResult{OK: true, Code: "healthy", Status: status}
 	}
-	return FrontProxyTestResult{Code: "inconclusive", Status: status}
+	if ctx.Err() != nil {
+		return FrontProxyTestResult{Code: "canceled", Status: status}
+	}
+	return FrontProxyTestResult{Code: "unhealthy", Status: status}
 }
 
 // UpdateFrontProxy persists and activates a new connector for future

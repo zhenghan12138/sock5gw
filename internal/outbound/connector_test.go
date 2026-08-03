@@ -111,6 +111,54 @@ func TestConnectorDisabledUsesSingleSOCKS5Hop(t *testing.T) {
 	}
 }
 
+func TestConnectFrontProbesTargetWithoutExitProxy(t *testing.T) {
+	front := startTestSOCKSServer(t, socksServerOptions{
+		username: "front-user",
+		password: "front-password",
+	})
+	connector, err := New(config.FrontProxy{
+		Enabled:  true,
+		Protocol: "socks5",
+		Address:  front.address,
+		Username: "front-user",
+		Password: "front-password",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, err := connector.ConnectFront(ctx, "public-check.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	assertTarget(t, front.targets, "public-check.example:443")
+	if status := connector.FrontStatus(); status.Status != "healthy" || status.LastError != "" {
+		t.Fatalf("front status = %+v", status)
+	}
+}
+
+func TestConnectFrontReportsTargetFailure(t *testing.T) {
+	front := startTestSOCKSServer(t, socksServerOptions{connectReply: 5})
+	connector, err := New(config.FrontProxy{Enabled: true, Protocol: "socks5", Address: front.address}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = connector.ConnectFront(ctx, "public-check.example:443")
+	assertPhase(t, err, PhaseFrontConnectTarget)
+	if scope := FailureScopeOf(err); scope != FailureScopeShared {
+		t.Fatalf("front target failure scope = %q", scope)
+	}
+	if status := connector.FrontStatus(); status.Status != "unhealthy" || status.LastError != "front proxy could not reach test target" {
+		t.Fatalf("front status = %+v", status)
+	}
+}
+
 func TestFrontAuthenticationFailureIsSharedAndSanitized(t *testing.T) {
 	front := startTestSOCKSServer(t, socksServerOptions{
 		username: "expected-user",

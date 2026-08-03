@@ -631,18 +631,18 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         'front proxy dial failed':'无法连接前置代理',
         'front proxy authentication failed':'前置代理认证失败',
         'front proxy handshake failed':'前置代理 SOCKS5 握手失败',
+        'front proxy could not reach test target':'前置代理无法访问公网检测目标',
         'front proxy could not connect to exit':'前置代理无法连接当前出口',
         'front proxy could not connect to any candidate exit':'前置代理无法连接任何可用出口'
       };
       return messages[value] || value;
     }
     function frontTestText(data) {
-      if (data.ok) return '检测通过：完整前置链路可用';
+      if (data.ok) return '检测通过：前置代理公网连接正常';
       const messages = {
         disabled:'前置代理未启用，无需检测',
-        no_exit:'无法检测：代理池中没有可用出口',
         canceled:'检测已取消',
-        inconclusive:'无法确认：前置代理或当前出口不可达，请检查后再次检测'
+        inconclusive:'无法确认前置代理公网连通性，请检查后再次检测'
       };
       if (data.code === 'unhealthy') return '检测失败：' + frontErrorText(data.status?.last_error || '前置链路不可用');
       return messages[data.code] || '检测未完成';
@@ -665,7 +665,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       const result = document.getElementById('frontResult');
       const button = document.getElementById('frontTest');
       button.disabled = true;
-      result.textContent = '正在检测完整前置链路...';
+      result.textContent = '正在检测前置代理公网连通性...';
       try {
         const data = await api('/v1/admin/front-proxy/test', { method:'POST', body:'{}' });
         renderFrontStatus(data.status || {});

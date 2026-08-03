@@ -87,6 +87,14 @@ func rejectingFrontProxy(t *testing.T) (string, *atomic.Int64) {
 }
 
 func connectRejectingFrontProxy(t *testing.T) (string, *atomic.Int64) {
+	return connectReplyingFrontProxy(t, 5)
+}
+
+func connectAcceptingFrontProxy(t *testing.T) (string, *atomic.Int64) {
+	return connectReplyingFrontProxy(t, 0)
+}
+
+func connectReplyingFrontProxy(t *testing.T, reply byte) (string, *atomic.Int64) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -101,13 +109,13 @@ func connectRejectingFrontProxy(t *testing.T) (string, *atomic.Int64) {
 				return
 			}
 			accepts.Add(1)
-			go rejectSOCKSConnect(conn)
+			go replySOCKSConnect(conn, reply)
 		}
 	}()
 	return listener.Addr().String(), &accepts
 }
 
-func rejectSOCKSConnect(conn net.Conn) {
+func replySOCKSConnect(conn net.Conn, reply byte) {
 	defer conn.Close()
 	greeting := make([]byte, 2)
 	if _, err := io.ReadFull(conn, greeting); err != nil || greeting[0] != 5 {
@@ -141,7 +149,7 @@ func rejectSOCKSConnect(conn net.Conn) {
 	if _, err := io.CopyN(io.Discard, conn, int64(addressLength+2)); err != nil {
 		return
 	}
-	_, _ = conn.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+	_, _ = conn.Write([]byte{5, reply, 0, 1, 0, 0, 0, 0, 0, 0})
 }
 
 func waitForLeaseStatus(t *testing.T, m *Manager, clientIP string, status string) Assignment {
@@ -1214,17 +1222,21 @@ func TestFrontAddressCannotBeUsedAsExit(t *testing.T) {
 	}
 }
 
-func TestFrontProxyTestReportsDisabledAndMissingExit(t *testing.T) {
+func TestFrontProxyTestReportsDisabledAndDoesNotRequireExit(t *testing.T) {
 	disabled := testManager(t, 1).TestFrontProxy(context.Background())
 	if disabled.OK || disabled.Code != "disabled" || disabled.Status.Status != "disabled" {
 		t.Fatalf("disabled test result = %+v", disabled)
 	}
 
+	frontAddress, accepts := connectAcceptingFrontProxy(t)
 	cfg := testConfig(0)
-	cfg.FrontProxy = config.FrontProxy{Enabled: true, Protocol: "socks5", Address: "127.0.0.1:11080"}
+	cfg.FrontProxy = config.FrontProxy{Enabled: true, Protocol: "socks5", Address: frontAddress}
 	noExit := testManagerFromConfig(t, cfg).TestFrontProxy(context.Background())
-	if noExit.OK || noExit.Code != "no_exit" || noExit.Status.Status != "unknown" {
+	if !noExit.OK || noExit.Code != "healthy" || noExit.Status.Status != "healthy" {
 		t.Fatalf("no-exit test result = %+v", noExit)
+	}
+	if got := accepts.Load(); got != 1 {
+		t.Fatalf("front accepts = %d, want 1", got)
 	}
 }
 

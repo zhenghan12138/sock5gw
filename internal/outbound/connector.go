@@ -19,15 +19,16 @@ const (
 )
 
 const (
-	PhaseFrontDial        = "front_dial"
-	PhaseFrontCircuit     = "front_circuit"
-	PhaseFrontHandshake   = "front_handshake"
-	PhaseFrontAuth        = "front_auth"
-	PhaseFrontConnectExit = "front_connect_exit"
-	PhaseExitDial         = "exit_dial"
-	PhaseExitHandshake    = "exit_handshake"
-	PhaseExitAuth         = "exit_auth"
-	PhaseExitConnect      = "exit_connect_target"
+	PhaseFrontDial          = "front_dial"
+	PhaseFrontCircuit       = "front_circuit"
+	PhaseFrontHandshake     = "front_handshake"
+	PhaseFrontAuth          = "front_auth"
+	PhaseFrontConnectExit   = "front_connect_exit"
+	PhaseFrontConnectTarget = "front_connect_target"
+	PhaseExitDial           = "exit_dial"
+	PhaseExitHandshake      = "exit_handshake"
+	PhaseExitAuth           = "exit_auth"
+	PhaseExitConnect        = "exit_connect_target"
 )
 
 // FailureScope expresses which ownership boundary should react to a failure.
@@ -120,7 +121,7 @@ func newEstablishedPhaseError(phase string, token FrontToken, err error) *PhaseE
 
 func scopeForPhase(phase string) FailureScope {
 	switch phase {
-	case PhaseFrontDial, PhaseFrontCircuit, PhaseFrontHandshake, PhaseFrontAuth:
+	case PhaseFrontDial, PhaseFrontCircuit, PhaseFrontHandshake, PhaseFrontAuth, PhaseFrontConnectTarget:
 		return FailureScopeShared
 	case PhaseFrontConnectExit:
 		return FailureScopeAmbiguous
@@ -339,6 +340,93 @@ func (c *Connector) Connect(ctx context.Context, exit Endpoint, target string) (
 		return c.connectDirect(ctx, exit, target)
 	}
 	return c.connectThroughFront(ctx, exit, target)
+}
+
+// ConnectFront verifies the front SOCKS5 proxy by opening a tunnel directly
+// to target. It does not involve an exit proxy from the managed pool.
+func (c *Connector) ConnectFront(ctx context.Context, target string) (net.Conn, error) {
+	if c == nil {
+		return nil, errors.New("nil outbound connector")
+	}
+	if ctx == nil {
+		return nil, errors.New("nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.front.Enabled {
+		return nil, errors.New("front proxy is disabled")
+	}
+	if err := validateAddress(target); err != nil {
+		return nil, newPhaseError(PhaseFrontConnectTarget, err)
+	}
+
+	attempt, err := c.beginFrontAttempt()
+	if err != nil {
+		return nil, err
+	}
+	attemptResolved := false
+	defer func() {
+		if !attemptResolved {
+			c.abandonFrontAttempt(attempt)
+		}
+	}()
+	conn, err := c.dialAddress(ctx, c.front.Address)
+	if err != nil {
+		if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+			return nil, ctxErr
+		}
+		phaseErr := newPhaseError(PhaseFrontDial, contextCause(ctx, err))
+		c.recordFrontFailure(attempt, phaseErr.Phase)
+		attemptResolved = true
+		return nil, phaseErr
+	}
+	cleanup, err := bindConnContext(ctx, conn)
+	if err != nil {
+		_ = conn.Close()
+		if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+			return nil, ctxErr
+		}
+		phaseErr := newPhaseError(PhaseFrontHandshake, contextCause(ctx, err))
+		c.recordFrontFailure(attempt, phaseErr.Phase)
+		attemptResolved = true
+		return nil, phaseErr
+	}
+	succeeded := false
+	defer func() {
+		cleanup()
+		if !succeeded {
+			_ = conn.Close()
+		}
+	}()
+
+	frontClient := socks5Client{conn: conn}
+	if err := frontClient.handshake(c.front.Username, c.front.Password); err != nil {
+		if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+			return nil, ctxErr
+		}
+		phase := frontHandshakePhase(err)
+		phaseErr := newPhaseError(phase, contextCause(ctx, err))
+		c.recordFrontFailure(attempt, phase)
+		attemptResolved = true
+		return nil, phaseErr
+	}
+	if err := frontClient.connect(target); err != nil {
+		if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+			return nil, ctxErr
+		}
+		phaseErr := newPhaseError(PhaseFrontConnectTarget, contextCause(ctx, err))
+		c.recordFrontFailure(attempt, phaseErr.Phase)
+		attemptResolved = true
+		return nil, phaseErr
+	}
+	if _, current := c.recordFrontSuccess(attempt, target); !current {
+		attemptResolved = true
+		return nil, newPhaseError(PhaseFrontCircuit, errors.New("front proxy probe was superseded"))
+	}
+	attemptResolved = true
+	succeeded = true
+	return conn, nil
 }
 
 func (c *Connector) connectDirect(ctx context.Context, exit Endpoint, target string) (net.Conn, error) {
@@ -613,6 +701,8 @@ func publicFrontError(phase string) string {
 		return "front proxy handshake failed"
 	case PhaseFrontConnectExit:
 		return "front proxy could not connect to exit"
+	case PhaseFrontConnectTarget:
+		return "front proxy could not reach test target"
 	default:
 		return "front proxy failed"
 	}
