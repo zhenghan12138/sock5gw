@@ -45,14 +45,49 @@ func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler 
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		writeJSON(w, m.LeaseContext(r.Context(), clientIP(r, cfg.TrustProxy)))
+		request, err := decodeOptionalDynamicLeaseRequest(r)
+		if err != nil {
+			writeLeaseAPIError(w, &LeaseAPIError{Code: "invalid_request", Message: err.Error(), Err: err})
+			return
+		}
+		ip := clientIP(r, cfg.TrustProxy)
+		if request != nil {
+			assignment, err := m.LeaseDynamicContext(r.Context(), ip, *request, false)
+			if err != nil {
+				writeLeaseAPIError(w, err)
+				return
+			}
+			writeJSON(w, assignment)
+			return
+		}
+		writeJSON(w, m.LeaseContext(r.Context(), ip))
 	})
 	mux.HandleFunc("POST /v1/lease/refresh", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.ClientKey) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		writeJSON(w, m.RefreshContext(r.Context(), clientIP(r, cfg.TrustProxy)))
+		request, err := decodeOptionalDynamicLeaseRequest(r)
+		if err != nil {
+			writeLeaseAPIError(w, &LeaseAPIError{Code: "invalid_request", Message: err.Error(), Err: err})
+			return
+		}
+		ip := clientIP(r, cfg.TrustProxy)
+		if request == nil {
+			if current, ok := m.DynamicRequestForClient(ip); ok {
+				request = &current
+			}
+		}
+		if request != nil {
+			assignment, err := m.LeaseDynamicContext(r.Context(), ip, *request, true)
+			if err != nil {
+				writeLeaseAPIError(w, err)
+				return
+			}
+			writeJSON(w, assignment)
+			return
+		}
+		writeJSON(w, m.RefreshContext(r.Context(), ip))
 	})
 	mux.HandleFunc("GET /v1/lease", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.ClientKey) {
@@ -142,6 +177,54 @@ func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler 
 		}
 		writeJSON(w, m.TestFrontProxy(r.Context()))
 	})
+	mux.HandleFunc("GET /v1/admin/proxy-api", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if runtimeCfg == nil {
+			http.Error(w, "runtime config unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, runtimeCfg.ProxyAPI())
+	})
+	mux.HandleFunc("PUT /v1/admin/proxy-api", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if runtimeCfg == nil {
+			http.Error(w, "runtime config unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var in config.ProxyAPI
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if err := runtimeCfg.UpdateProxyAPI(in); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, runtimeCfg.ProxyAPI())
+	})
+	mux.HandleFunc("POST /v1/admin/proxy-api/test", func(w http.ResponseWriter, r *http.Request) {
+		if !checkKey(r, cfg.AdminKey) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var in DynamicLeaseRequest
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeLeaseAPIError(w, &LeaseAPIError{Code: "invalid_request", Message: "invalid json", Err: err})
+			return
+		}
+		result, err := m.TestProxyAPI(r.Context(), in)
+		if err != nil {
+			writeLeaseAPIError(w, err)
+			return
+		}
+		writeJSON(w, result)
+	})
 	mux.HandleFunc("POST /v1/admin/ip-geo", func(w http.ResponseWriter, r *http.Request) {
 		if !checkKey(r, cfg.AdminKey) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -162,15 +245,32 @@ func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler 
 			return
 		}
 		var in struct {
-			ClientIP string `json:"client_ip"`
+			ClientIP        string  `json:"client_ip"`
+			Country         *string `json:"country"`
+			DurationMinutes *int64  `json:"duration_minutes"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
-		assignment, err := m.AdminLeaseContext(r.Context(), strings.TrimSpace(in.ClientIP))
+		ip := strings.TrimSpace(in.ClientIP)
+		if parsed := net.ParseIP(ip); parsed == nil || parsed.To4() == nil {
+			http.Error(w, "valid IPv4 client_ip is required", http.StatusBadRequest)
+			return
+		}
+		request, err := dynamicLeaseRequestFromPointers(in.Country, in.DurationMinutes)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeLeaseAPIError(w, &LeaseAPIError{Code: "invalid_request", Message: err.Error(), Err: err})
+			return
+		}
+		var assignment Assignment
+		if request != nil {
+			assignment, err = m.LeaseDynamicContext(r.Context(), ip, *request, false)
+		} else {
+			assignment, err = m.AdminLeaseContext(r.Context(), ip)
+		}
+		if err != nil {
+			writeLeaseAPIError(w, err)
 			return
 		}
 		writeJSON(w, assignment)
@@ -330,9 +430,16 @@ func NewAPI(m *Manager, cfg config.API, runtimeCfg *RuntimeConfig) http.Handler 
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		assignment, err := m.AdminRefreshContext(r.Context(), strings.TrimSpace(r.PathValue("ip")))
+		ip := strings.TrimSpace(r.PathValue("ip"))
+		var assignment Assignment
+		var err error
+		if current, ok := m.DynamicRequestForClient(ip); ok {
+			assignment, err = m.LeaseDynamicContext(r.Context(), ip, current, true)
+		} else {
+			assignment, err = m.AdminRefreshContext(r.Context(), ip)
+		}
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeLeaseAPIError(w, err)
 			return
 		}
 		writeJSON(w, assignment)
@@ -439,13 +546,15 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     button:disabled { cursor:not-allowed; opacity:.6; }
     .token { width:320px; max-width:45vw; }
     .front-form { grid-template-columns:auto minmax(280px,1fr) auto auto; align-items:end; }
+    .api-form { grid-template-columns:auto minmax(320px,1fr) 150px 150px auto; align-items:end; }
+    .api-test { padding:11px 16px; border-top:1px solid var(--line); display:grid; grid-template-columns:120px 160px auto minmax(180px,1fr); gap:8px; align-items:end; }
     .front-toggle,.front-clear { min-height:34px; display:flex; align-items:center; gap:8px; white-space:nowrap; }
     .front-actions { display:flex; gap:8px; align-items:center; }
     .field { display:grid; gap:5px; color:var(--muted); font-size:12px; }
     .field input { color:var(--text); font-size:14px; }
     .config-meta { padding:11px 16px; border-top:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px 20px; align-items:center; }
     .config-meta span:last-child { margin-left:auto; }
-    @media (max-width:900px) { .stats { grid-template-columns:repeat(2,1fr); } form,.front-form { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } .token { max-width:none; width:100%; } table { font-size:12px; } .config-meta span:last-child { width:100%; margin-left:0; } }
+    @media (max-width:900px) { .stats { grid-template-columns:repeat(2,1fr); } form,.front-form,.api-form,.api-test { grid-template-columns:1fr; } header { align-items:flex-start; flex-direction:column; } .token { max-width:none; width:100%; } table { font-size:12px; } .config-meta span:last-child { width:100%; margin-left:0; } }
   </style>
 </head>
 <body>
@@ -479,9 +588,28 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       </div>
     </section>
     <section>
+      <div class="section-head">
+        <h2>API 代理模式</h2>
+        <span id="proxyAPIStatus" class="pill disabled">未启用</span>
+      </div>
+      <form id="proxyAPIForm" class="api-form">
+        <label class="front-toggle"><input id="proxyAPIEnabled" type="checkbox"> 启用</label>
+        <label class="field"><span>供应商 API URL</span><input id="proxyAPIURL" type="url" placeholder="https://provider.example/api?num=1&amp;type=json" autocomplete="off" spellcheck="false"></label>
+        <label class="field"><span>国家参数名</span><input id="proxyAPICountryParam" value="region" required></label>
+        <label class="field"><span>时长参数名</span><input id="proxyAPIDurationParam" value="time" required></label>
+        <button id="proxyAPISave" class="primary">保存配置</button>
+      </form>
+      <div class="api-test">
+        <label class="field"><span>测试国家</span><input id="proxyAPITestCountry" value="Rand"></label>
+        <label class="field"><span>测试时长（分钟）</span><input id="proxyAPITestDuration" type="number" min="1" step="1" value="10"></label>
+        <button id="proxyAPITest" type="button">测试申请</button>
+        <span id="proxyAPIResult" class="muted"></span>
+      </div>
+    </section>
+    <section>
       <div class="section-head"><h2>在线客户端</h2><button onclick="load()">刷新</button></div>
       <table>
-        <thead><tr><th>客户端 IP</th><th>状态</th><th>代理</th><th>出口 IP</th><th>连接数</th><th>到期时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>客户端 IP</th><th>状态</th><th>模式</th><th>国家</th><th>代理</th><th>出口 IP</th><th>连接数</th><th>到期时间</th><th>操作</th></tr></thead>
         <tbody id="clients"></tbody>
       </table>
       <form id="clientForm" style="grid-template-columns:1fr auto;">
@@ -512,7 +640,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       </div>
     </section>
     <section>
-			<div class="section-head"><h2>代理池</h2><span class="muted">出口 IP 在分配客户端前通过 SOCKS5 检测获取</span></div>
+      <div class="section-head"><h2>代理池</h2><span class="muted">出口 IP 在分配客户端前通过 SOCKS5 检测获取</span></div>
       <div style="padding:12px 16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
         <button onclick="batchDisable(false)">批量启用</button>
         <button onclick="batchDisable(true)">批量停用</button>
@@ -530,7 +658,7 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         <button onclick="nextPage()">下一页</button>
       </div>
       <table>
-        <thead><tr><th><input type="checkbox" id="checkPage" onchange="togglePageSelection(this.checked)"></th><th>ID</th><th>地址</th><th>状态</th><th>出口 IP</th><th>客户端</th><th>连接数</th><th>健康详情</th><th>操作</th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="checkPage" onchange="togglePageSelection(this.checked)"></th><th>ID</th><th>来源</th><th>国家</th><th>地址</th><th>状态</th><th>出口 IP</th><th>客户端</th><th>连接数</th><th>动态到期</th><th>健康详情</th><th>操作</th></tr></thead>
         <tbody id="proxies"></tbody>
       </table>
       <form id="proxyForm">
@@ -580,7 +708,16 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     }
     async function api(path, opts = {}) {
       const res = await fetch(path, { ...opts, headers: { ...auth(), ...(opts.headers || {}) } });
-      if (!res.ok) throw new Error((await res.text()).trim());
+      if (!res.ok) {
+        const text = (await res.text()).trim();
+        try {
+          const data = JSON.parse(text);
+          throw new Error(data.message || data.code || text);
+        } catch (err) {
+          if (err instanceof SyntaxError) throw new Error(text);
+          throw err;
+        }
+      }
       if (res.status === 204) return null;
       return res.json();
     }
@@ -602,6 +739,8 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         const tr = document.createElement('tr');
         const ip = tr.insertCell(); setText(ip, c.client_ip);
         const status = tr.insertCell(); appendPill(status, c.status);
+        setText(tr.insertCell(), c.mode || 'pool');
+        setText(tr.insertCell(), c.country);
         const proxy = tr.insertCell(); setText(proxy, c.proxy_id);
         const proxyAddr = document.createElement('div'); proxyAddr.className = 'muted'; proxyAddr.textContent = c.proxy_address || ''; proxy.appendChild(proxyAddr);
         setIPText(tr.insertCell(), c.exit_ip);
@@ -678,6 +817,39 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         button.disabled = false;
       }
     }
+    function renderProxyAPIConfig(data) {
+      document.getElementById('proxyAPIEnabled').checked = !!data.enabled;
+      document.getElementById('proxyAPIURL').value = data.url || '';
+      document.getElementById('proxyAPICountryParam').value = data.country_param || 'region';
+      document.getElementById('proxyAPIDurationParam').value = data.duration_param || 'time';
+      const status = document.getElementById('proxyAPIStatus');
+      status.className = 'pill ' + (data.enabled ? 'healthy' : 'disabled');
+      status.textContent = data.enabled ? '已启用' : '未启用';
+    }
+    async function loadProxyAPI() {
+      renderProxyAPIConfig(await api('/v1/admin/proxy-api'));
+    }
+    async function testProxyAPI() {
+      if (!confirm('测试会向供应商申请 1 个代理并消耗一次额度，确认继续？')) return;
+      const button = document.getElementById('proxyAPITest');
+      const result = document.getElementById('proxyAPIResult');
+      button.disabled = true;
+      result.textContent = '正在申请并检测...';
+      try {
+        const data = await api('/v1/admin/proxy-api/test', {
+          method:'POST',
+          body:JSON.stringify({
+            country:document.getElementById('proxyAPITestCountry').value.trim(),
+            duration_minutes:Number(document.getElementById('proxyAPITestDuration').value)
+          })
+        });
+        result.textContent = '检测通过：' + (data.address || '-') + (data.exit_ip ? '，出口 ' + data.exit_ip : '') + '，' + data.elapsed_ms + ' ms';
+      } catch (err) {
+        result.textContent = '检测失败：' + err.message;
+      } finally {
+        button.disabled = false;
+      }
+    }
     async function loadRouting() {
       routingConfig = await api('/v1/admin/routing');
       document.getElementById('routingEnabled').checked = !!routingConfig.enabled;
@@ -719,11 +891,14 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
         checkbox.onchange = () => toggleProxySelection(p.id, checkbox.checked);
         checked.appendChild(checkbox);
         setText(tr.insertCell(), p.id);
+        setText(tr.insertCell(), p.source || 'pool');
+        setText(tr.insertCell(), p.country);
         setText(tr.insertCell(), p.address);
         appendPill(tr.insertCell(), p.status);
         setIPText(tr.insertCell(), p.exit_ip);
         setText(tr.insertCell(), p.client_ip || p.draining_for);
         setText(tr.insertCell(), p.active_connections || 0);
+        setText(tr.insertCell(), fmtTime(p.provider_expires_at));
         const detail = tr.insertCell(); detail.className = 'muted'; setText(detail, p.last_health_detail);
         const actions = tr.insertCell();
         const toggle = document.createElement('button'); toggle.textContent = p.disabled ? '启用' : '停用'; toggle.onclick = () => toggleProxy(p.id, !p.disabled); actions.appendChild(toggle);
@@ -842,6 +1017,31 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
       }
     });
     document.getElementById('frontTest').addEventListener('click', testFrontProxy);
+    document.getElementById('proxyAPIForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const save = document.getElementById('proxyAPISave');
+      const result = document.getElementById('proxyAPIResult');
+      save.disabled = true;
+      result.textContent = '保存中...';
+      try {
+        const next = await api('/v1/admin/proxy-api', {
+          method:'PUT',
+          body:JSON.stringify({
+            enabled:document.getElementById('proxyAPIEnabled').checked,
+            url:document.getElementById('proxyAPIURL').value.trim(),
+            country_param:document.getElementById('proxyAPICountryParam').value.trim(),
+            duration_param:document.getElementById('proxyAPIDurationParam').value.trim()
+          })
+        });
+        renderProxyAPIConfig(next);
+        result.textContent = '配置已保存';
+      } catch (err) {
+        result.textContent = '保存失败：' + err.message;
+      } finally {
+        save.disabled = false;
+      }
+    });
+    document.getElementById('proxyAPITest').addEventListener('click', testProxyAPI);
     async function importProxies() {
       const text = document.getElementById('importText').value;
       const el = document.getElementById('importResult');
@@ -870,6 +1070,9 @@ var adminTemplate = template.Must(template.New("admin").Parse(`<!doctype html>
     load().catch(err => alert(err.message));
     loadFrontProxy().catch(err => {
       document.getElementById('frontResult').textContent = '加载失败：' + err.message;
+    });
+    loadProxyAPI().catch(err => {
+      document.getElementById('proxyAPIResult').textContent = '加载失败：' + err.message;
     });
     loadRouting().catch(console.error);
     setInterval(() => load().catch(console.error), 5000);
@@ -902,6 +1105,65 @@ func clientIP(r *http.Request, trustProxy bool) string {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func decodeOptionalDynamicLeaseRequest(r *http.Request) (*DynamicLeaseRequest, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024+1))
+	if err != nil {
+		return nil, errors.New("read request body failed")
+	}
+	if len(body) > 64*1024 {
+		return nil, errors.New("request body exceeds 64 KiB")
+	}
+	if strings.TrimSpace(string(body)) == "" {
+		return nil, nil
+	}
+	var in struct {
+		Country         *string `json:"country"`
+		DurationMinutes *int64  `json:"duration_minutes"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&in); err != nil {
+		return nil, errors.New("invalid json")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, errors.New("invalid json")
+	}
+	return dynamicLeaseRequestFromPointers(in.Country, in.DurationMinutes)
+}
+
+func dynamicLeaseRequestFromPointers(country *string, durationMinutes *int64) (*DynamicLeaseRequest, error) {
+	if country == nil && durationMinutes == nil {
+		return nil, nil
+	}
+	if country == nil || durationMinutes == nil {
+		return nil, errors.New("country and duration_minutes must be provided together")
+	}
+	request, err := NormalizeDynamicLeaseRequest(DynamicLeaseRequest{Country: *country, DurationMinutes: *durationMinutes})
+	if err != nil {
+		return nil, err
+	}
+	return &request, nil
+}
+
+func writeLeaseAPIError(w http.ResponseWriter, err error) {
+	var apiErr *LeaseAPIError
+	if !errors.As(err, &apiErr) {
+		apiErr = &LeaseAPIError{Code: "internal_error", Message: "internal server error", Err: err}
+	}
+	status := http.StatusBadGateway
+	switch apiErr.Code {
+	case "invalid_request":
+		status = http.StatusBadRequest
+	case "proxy_api_disabled":
+		status = http.StatusServiceUnavailable
+	case "internal_error":
+		status = http.StatusInternalServerError
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(apiErr)
 }
 
 type ipGeoInfo struct {

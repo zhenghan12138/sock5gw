@@ -30,6 +30,13 @@ type Proxy struct {
 	UpdatedAt time.Time
 }
 
+type DynamicProxy struct {
+	ProxyID           string
+	Country           string
+	DurationMinutes   int64
+	ProviderExpiresAt time.Time
+}
+
 func Open(path string) (*DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -74,6 +81,12 @@ CREATE TABLE IF NOT EXISTS proxies (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dynamic_proxies (
+  proxy_id TEXT PRIMARY KEY,
+  country TEXT NOT NULL,
+  duration_minutes INTEGER NOT NULL,
+  provider_expires_at INTEGER NOT NULL
+);
 `)
 	return err
 }
@@ -102,8 +115,19 @@ ON CONFLICT(id) DO UPDATE SET
 }
 
 func (db *DB) DeleteProxy(ctx context.Context, id string) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM proxies WHERE id=?`, id)
-	return err
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dynamic_proxies WHERE proxy_id=?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM proxies WHERE id=?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func (db *DB) ListProxies(ctx context.Context) ([]Proxy, error) {
@@ -126,6 +150,102 @@ func (db *DB) ListProxies(ctx context.Context) ([]Proxy, error) {
 		proxies = append(proxies, p)
 	}
 	return proxies, rows.Err()
+}
+
+func (db *DB) ListDynamicProxies(ctx context.Context) ([]DynamicProxy, error) {
+	rows, err := db.QueryContext(ctx, `SELECT proxy_id, country, duration_minutes, provider_expires_at FROM dynamic_proxies`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var proxies []DynamicProxy
+	for rows.Next() {
+		var proxy DynamicProxy
+		var expiresAt int64
+		if err := rows.Scan(&proxy.ProxyID, &proxy.Country, &proxy.DurationMinutes, &expiresAt); err != nil {
+			return nil, err
+		}
+		proxy.ProviderExpiresAt = time.Unix(expiresAt, 0)
+		proxies = append(proxies, proxy)
+	}
+	return proxies, rows.Err()
+}
+
+func (db *DB) ActivateDynamicLease(ctx context.Context, proxy Proxy, dynamic DynamicProxy, lease Lease, deleteProxyID string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		_ = tx.Rollback()
+		return err
+	}
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO proxies(id, address, username, password, disabled, created_at, updated_at)
+VALUES(?, ?, ?, ?, 0, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  address=excluded.address,
+  username=excluded.username,
+  password=excluded.password,
+  disabled=0,
+  updated_at=excluded.updated_at`,
+		proxy.ID, proxy.Address, proxy.Username, proxy.Password, now.Unix(), now.Unix()); err != nil {
+		return rollback(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO dynamic_proxies(proxy_id, country, duration_minutes, provider_expires_at)
+VALUES(?, ?, ?, ?)
+ON CONFLICT(proxy_id) DO UPDATE SET
+  country=excluded.country,
+  duration_minutes=excluded.duration_minutes,
+  provider_expires_at=excluded.provider_expires_at`,
+		dynamic.ProxyID, dynamic.Country, dynamic.DurationMinutes, dynamic.ProviderExpiresAt.Unix()); err != nil {
+		return rollback(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO leases(client_ip, proxy_id, status, expires_at, updated_at)
+VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(client_ip) DO UPDATE SET
+  proxy_id=excluded.proxy_id,
+  status=excluded.status,
+  expires_at=excluded.expires_at,
+  updated_at=excluded.updated_at`,
+		lease.ClientIP, lease.ProxyID, lease.Status, lease.ExpiresAt.Unix(), lease.UpdatedAt.Unix()); err != nil {
+		return rollback(err)
+	}
+	if deleteProxyID != "" && deleteProxyID != proxy.ID {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM dynamic_proxies WHERE proxy_id=?`, deleteProxyID); err != nil {
+			return rollback(err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM proxies WHERE id=?`, deleteProxyID); err != nil {
+			return rollback(err)
+		}
+	}
+	return tx.Commit()
+}
+
+func (db *DB) DeleteLeaseAndProxy(ctx context.Context, clientIP, proxyID string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM leases WHERE client_ip=?`, clientIP); err != nil {
+		return rollback(err)
+	}
+	if proxyID != "" {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM dynamic_proxies WHERE proxy_id=?`, proxyID); err != nil {
+			return rollback(err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM proxies WHERE id=?`, proxyID); err != nil {
+			return rollback(err)
+		}
+	}
+	return tx.Commit()
 }
 
 func (db *DB) UpsertLease(ctx context.Context, l Lease) error {

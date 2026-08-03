@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ type Config struct {
 	API         API           `json:"api"`
 	Gateway     Gateway       `json:"gateway"`
 	FrontProxy  FrontProxy    `json:"front_proxy"`
+	ProxyAPI    ProxyAPI      `json:"proxy_api"`
 	DNS         DNS           `json:"dns"`
 	Routing     Routing       `json:"routing"`
 	Proxies     []ProxyConfig `json:"proxies"`
@@ -30,6 +32,13 @@ type FrontProxy struct {
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 	FailOpen bool   `json:"fail_open"`
+}
+
+type ProxyAPI struct {
+	Enabled       bool   `json:"enabled"`
+	URL           string `json:"url"`
+	CountryParam  string `json:"country_param"`
+	DurationParam string `json:"duration_param"`
 }
 
 type API struct {
@@ -154,6 +163,12 @@ func (cfg *Config) setDefaults() {
 	if cfg.FrontProxy.Enabled && cfg.FrontProxy.Protocol == "" {
 		cfg.FrontProxy.Protocol = "socks5"
 	}
+	if cfg.ProxyAPI.CountryParam == "" {
+		cfg.ProxyAPI.CountryParam = "region"
+	}
+	if cfg.ProxyAPI.DurationParam == "" {
+		cfg.ProxyAPI.DurationParam = "time"
+	}
 	if cfg.DNS.Listen == "" {
 		cfg.DNS.Listen = "0.0.0.0:5353"
 	}
@@ -205,6 +220,9 @@ func (cfg *Config) validate() error {
 	if err := validateFrontProxy(cfg.FrontProxy); err != nil {
 		return err
 	}
+	if err := ValidateProxyAPI(cfg.ProxyAPI); err != nil {
+		return err
+	}
 	if err := validateRoutingAction("routing.default_action", cfg.Routing.DefaultAction); err != nil {
 		return err
 	}
@@ -225,6 +243,44 @@ func (cfg *Config) validate() error {
 		if _, _, err := net.SplitHostPort(p.Address); err != nil {
 			return fmt.Errorf("proxy %s address: %w", p.ID, err)
 		}
+	}
+	return nil
+}
+
+func ValidateProxyAPI(proxyAPI ProxyAPI) error {
+	proxyAPI.URL = strings.TrimSpace(proxyAPI.URL)
+	proxyAPI.CountryParam = strings.TrimSpace(proxyAPI.CountryParam)
+	proxyAPI.DurationParam = strings.TrimSpace(proxyAPI.DurationParam)
+	if proxyAPI.CountryParam == "" {
+		return errors.New("proxy_api.country_param is required")
+	}
+	if proxyAPI.DurationParam == "" {
+		return errors.New("proxy_api.duration_param is required")
+	}
+	if proxyAPI.CountryParam == proxyAPI.DurationParam {
+		return errors.New("proxy_api country and duration parameters must differ")
+	}
+	if strings.ContainsAny(proxyAPI.CountryParam+proxyAPI.DurationParam, "\r\n") {
+		return errors.New("proxy_api parameter names must not contain newlines")
+	}
+	if proxyAPI.URL == "" {
+		if proxyAPI.Enabled {
+			return errors.New("proxy_api.url is required when enabled")
+		}
+		return nil
+	}
+	parsed, err := url.Parse(proxyAPI.URL)
+	if err != nil || parsed.Opaque != "" || parsed.Hostname() == "" {
+		return errors.New("proxy_api.url must be a valid absolute URL")
+	}
+	if strings.ToLower(parsed.Scheme) != "https" {
+		return errors.New("proxy_api.url must use https://")
+	}
+	if parsed.User != nil {
+		return errors.New("proxy_api.url must not contain user info")
+	}
+	if parsed.Fragment != "" {
+		return errors.New("proxy_api.url must not contain a fragment")
 	}
 	return nil
 }

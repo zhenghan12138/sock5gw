@@ -60,6 +60,36 @@ this front-proxy path.
 See the [Chinese implementation plan](docs/front-proxy-p0-plan.md) and the
 [sslocal deployment guide](deployments/README.front-proxy.md).
 
+## Dynamic Proxy API
+
+The optional API mode acquires one exclusive SOCKS5 endpoint when a client
+supplies a country and duration. Requests without a JSON body continue to use
+the existing local proxy pool.
+
+```json
+"proxy_api": {
+  "enabled": true,
+  "url": "https://white.1024proxy.com/white/api?region=Rand&num=1&time=10&format=1&type=json",
+  "country_param": "region",
+  "duration_param": "time"
+}
+```
+
+```sh
+curl -H 'Authorization: Bearer change-client-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"country":"US","duration_minutes":10}' \
+  http://GATEWAY_IP:8080/v1/lease
+```
+
+Two-letter country codes and `Rand` are accepted. The requested duration is
+passed to the provider in minutes and also becomes the gateway lease lifetime.
+When `front_proxy` is enabled, provider HTTPS requests use the same SOCKS5
+front, so the provider must allowlist that front's public exit IP.
+Dynamic proxies are never added to the regular idle pool and are removed after
+release, expiry, or connection draining. See the [API documentation](docs/api.md)
+for refresh behavior, provider response formats, and management endpoints.
+
 ## API
 
 Use bearer tokens from `config.json`.
@@ -98,8 +128,8 @@ The page shows:
   current exit IP;
 - proxy pool status, health details, assigned client, active connections, and
   detected exit IP;
-- front SOCKS5 URL, credential presence, health status, and runtime enable or
-  disable controls;
+- front SOCKS5 URL, credential presence, public-connectivity status, and
+  runtime enable or disable controls;
 - add/delete proxies;
 - enable/disable proxies without restarting the service.
 

@@ -233,6 +233,31 @@ func TestDisabledFrontProxyPreservesCompatibility(t *testing.T) {
 	}
 }
 
+func TestProxyAPIDefaultsAndValidation(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.ProxyAPI = ProxyAPI{
+		Enabled: true,
+		URL:     "https://white.1024proxy.com/white/api?num=1&type=json",
+	}
+	cfg.setDefaults()
+	if cfg.ProxyAPI.CountryParam != "region" || cfg.ProxyAPI.DurationParam != "time" {
+		t.Fatalf("proxy API defaults = %+v", cfg.ProxyAPI)
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.ProxyAPI.URL = "http://provider.example/api"
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "https://") {
+		t.Fatalf("unsafe URL error = %v", err)
+	}
+	cfg.ProxyAPI.URL = "https://provider.example/api"
+	cfg.ProxyAPI.DurationParam = cfg.ProxyAPI.CountryParam
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("duplicate mapping error = %v", err)
+	}
+}
+
 func validTestConfig() *Config {
 	cfg := &Config{
 		API: API{

@@ -21,6 +21,7 @@ import (
 
 	"sock5gw/internal/config"
 	"sock5gw/internal/outbound"
+	"sock5gw/internal/providerapi"
 	"sock5gw/internal/store"
 )
 
@@ -35,6 +36,9 @@ const (
 	ProxyDraining  = "draining"
 	ProxyUnhealthy = "unhealthy"
 	ProxyDisabled  = "disabled"
+
+	ProxySourcePool = "pool"
+	ProxySourceAPI  = "api"
 
 	frontHalfOpenRetryDelay  = 100 * time.Millisecond
 	ambiguousQueueRetryDelay = 5 * time.Second
@@ -57,34 +61,44 @@ type pendingSnapshot struct {
 }
 
 type Proxy struct {
-	ID               string `json:"id"`
-	Address          string `json:"address"`
-	Username         string `json:"-"`
-	Password         string `json:"-"`
-	Status           string `json:"status"`
-	ClientIP         string `json:"client_ip,omitempty"`
-	DrainingFor      string `json:"draining_for,omitempty"`
-	ActiveConns      int    `json:"active_connections"`
-	FailureCount     int    `json:"failure_count"`
-	SuccessCount     int    `json:"success_count"`
-	LastHealthDetail string `json:"last_health_detail,omitempty"`
-	ExitIP           string `json:"exit_ip,omitempty"`
-	Disabled         bool   `json:"disabled"`
+	ID                string    `json:"id"`
+	Address           string    `json:"address"`
+	Username          string    `json:"-"`
+	Password          string    `json:"-"`
+	Status            string    `json:"status"`
+	ClientIP          string    `json:"client_ip,omitempty"`
+	DrainingFor       string    `json:"draining_for,omitempty"`
+	ActiveConns       int       `json:"active_connections"`
+	FailureCount      int       `json:"failure_count"`
+	SuccessCount      int       `json:"success_count"`
+	LastHealthDetail  string    `json:"last_health_detail,omitempty"`
+	ExitIP            string    `json:"exit_ip,omitempty"`
+	Disabled          bool      `json:"disabled"`
+	Source            string    `json:"source"`
+	Country           string    `json:"country,omitempty"`
+	DurationMinutes   int64     `json:"duration_minutes,omitempty"`
+	ProviderExpiresAt time.Time `json:"provider_expires_at,omitempty,omitzero"`
 }
 
 type LeaseView struct {
-	ClientIP  string    `json:"client_ip"`
-	ProxyID   string    `json:"proxy_id,omitempty"`
-	Status    string    `json:"status"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
-	QueuedAt  time.Time `json:"queued_at,omitempty"`
+	ClientIP        string    `json:"client_ip"`
+	ProxyID         string    `json:"proxy_id,omitempty"`
+	Status          string    `json:"status"`
+	ExpiresAt       time.Time `json:"expires_at,omitempty"`
+	QueuedAt        time.Time `json:"queued_at,omitempty"`
+	Mode            string    `json:"mode,omitempty"`
+	Country         string    `json:"country,omitempty"`
+	DurationMinutes int64     `json:"duration_minutes,omitempty"`
 }
 
 type Assignment struct {
-	ClientIP  string    `json:"client_ip"`
-	ProxyID   string    `json:"proxy_id,omitempty"`
-	Status    string    `json:"status"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	ClientIP        string    `json:"client_ip"`
+	ProxyID         string    `json:"proxy_id,omitempty"`
+	Status          string    `json:"status"`
+	ExpiresAt       time.Time `json:"expires_at,omitempty"`
+	Mode            string    `json:"mode,omitempty"`
+	Country         string    `json:"country,omitempty"`
+	DurationMinutes int64     `json:"duration_minutes,omitempty"`
 }
 
 type ProxyInput struct {
@@ -104,6 +118,9 @@ type ClientView struct {
 	ActiveConnections int       `json:"active_connections"`
 	ExpiresAt         time.Time `json:"expires_at,omitempty"`
 	Queued            bool      `json:"queued"`
+	Mode              string    `json:"mode,omitempty"`
+	Country           string    `json:"country,omitempty"`
+	DurationMinutes   int64     `json:"duration_minutes,omitempty"`
 }
 
 type ImportResult struct {
@@ -140,6 +157,11 @@ type Manager struct {
 	fake              *FakeIPStore
 	connectorMu       sync.RWMutex
 	connector         *outbound.Connector
+	proxyAPIMu        sync.RWMutex
+	proxyAPIClient    proxyAPIAcquirer
+	proxyAPIConfig    config.ProxyAPI
+	dynamicGatesMu    sync.Mutex
+	dynamicGates      map[string]*dynamicGate
 	probeProxy        proxyProbeFunc
 	queueCtx          context.Context
 	queueCancel       context.CancelFunc
@@ -157,6 +179,10 @@ func New(cfg *config.Config, db *store.DB) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	proxyAPIClient, err := providerapi.New(cfg.ProxyAPI, cfg.FrontProxy)
+	if err != nil {
+		return nil, err
+	}
 	queueCtx, queueCancel := context.WithCancel(context.Background())
 	m := &Manager{
 		cfg:            cfg,
@@ -166,6 +192,9 @@ func New(cfg *config.Config, db *store.DB) (*Manager, error) {
 		leases:         map[string]*LeaseView{},
 		conns:          map[string]map[net.Conn]struct{}{},
 		connector:      connector,
+		proxyAPIClient: proxyAPIClient,
+		proxyAPIConfig: cfg.ProxyAPI,
+		dynamicGates:   map[string]*dynamicGate{},
 		queueCtx:       queueCtx,
 		queueCancel:    queueCancel,
 	}
@@ -188,45 +217,94 @@ func New(cfg *config.Config, db *store.DB) (*Manager, error) {
 			return nil, err
 		}
 	}
-	storedProxies, err := db.ListProxies(context.Background())
+	ctx := context.Background()
+	storedProxies, err := db.ListProxies(ctx)
 	if err != nil {
 		return nil, err
 	}
+	dynamicProxies, err := db.ListDynamicProxies(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dynamicByID := make(map[string]store.DynamicProxy, len(dynamicProxies))
+	for _, dynamic := range dynamicProxies {
+		dynamicByID[dynamic.ProxyID] = dynamic
+	}
+	now := time.Now()
 	for _, p := range storedProxies {
 		if m.frontAddressConflict(p.Address) {
 			return nil, fmt.Errorf("stored proxy %s address must differ from front_proxy.address", p.ID)
+		}
+		dynamic, isDynamic := dynamicByID[p.ID]
+		if isDynamic && !dynamic.ProviderExpiresAt.After(now) {
+			_ = db.DeleteProxy(ctx, p.ID)
+			delete(dynamicByID, p.ID)
+			continue
 		}
 		status := ProxyIdle
 		if p.Disabled {
 			status = ProxyDisabled
 		}
-		m.proxies[p.ID] = &Proxy{
+		proxy := &Proxy{
 			ID:       p.ID,
 			Address:  p.Address,
 			Username: p.Username,
 			Password: p.Password,
 			Status:   status,
 			Disabled: p.Disabled,
+			Source:   ProxySourcePool,
 		}
+		if isDynamic {
+			proxy.Source = ProxySourceAPI
+			proxy.Country = dynamic.Country
+			proxy.DurationMinutes = dynamic.DurationMinutes
+			proxy.ProviderExpiresAt = dynamic.ProviderExpiresAt
+		}
+		m.proxies[p.ID] = proxy
 		m.proxyOrder = append(m.proxyOrder, p.ID)
+		delete(dynamicByID, p.ID)
 	}
-	leases, err := db.ListLeases(context.Background())
+	for id := range dynamicByID {
+		_ = db.DeleteProxy(ctx, id)
+	}
+	leases, err := db.ListLeases(ctx)
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now()
 	for _, l := range leases {
 		p := m.proxies[l.ProxyID]
 		if p == nil || l.ExpiresAt.Before(now) {
+			_ = db.DeleteLease(ctx, l.ClientIP)
+			continue
+		}
+		if p.Source == ProxySourceAPI && p.ProviderExpiresAt.Before(l.ExpiresAt) {
+			l.ExpiresAt = p.ProviderExpiresAt
+		}
+		if !l.ExpiresAt.After(now) {
+			_ = db.DeleteLease(ctx, l.ClientIP)
 			continue
 		}
 		p.Status = ProxyActive
 		p.ClientIP = l.ClientIP
-		m.leases[l.ClientIP] = &LeaseView{
+		lease := &LeaseView{
 			ClientIP:  l.ClientIP,
 			ProxyID:   l.ProxyID,
 			Status:    LeaseActive,
 			ExpiresAt: l.ExpiresAt,
+		}
+		if p.Source == ProxySourceAPI {
+			lease.Mode = ProxySourceAPI
+			lease.Country = p.Country
+			lease.DurationMinutes = p.DurationMinutes
+		}
+		m.leases[l.ClientIP] = lease
+	}
+	for _, id := range append([]string(nil), m.proxyOrder...) {
+		p := m.proxies[id]
+		if p != nil && p.Source == ProxySourceAPI && !m.proxyHasActiveLeaseLocked(id) {
+			delete(m.proxies, id)
+			m.proxyOrder = removeIP(m.proxyOrder, id)
+			_ = db.DeleteProxy(ctx, id)
 		}
 	}
 	return m, nil
@@ -298,7 +376,7 @@ func (m *Manager) Current(clientIP string) Assignment {
 		if m.inQueueLocked(m.pendingRefs, clientIP) {
 			status = LeasePending
 		}
-		return Assignment{ClientIP: clientIP, ProxyID: l.ProxyID, Status: status, ExpiresAt: l.ExpiresAt}
+		return assignmentFromLease(l, status)
 	}
 	return Assignment{ClientIP: clientIP, Status: LeaseBlocked}
 }
@@ -340,6 +418,7 @@ func (m *Manager) ConnectProxy(ctx context.Context, p Proxy, target string) (net
 func (m *Manager) UnregisterConn(clientIP, proxyID string, conn net.Conn) {
 	m.mu.Lock()
 	wakeQueue := false
+	deleteDynamic := ""
 	registered := false
 	if set := m.conns[clientIP]; set != nil {
 		if _, exists := set[conn]; exists {
@@ -352,7 +431,11 @@ func (m *Manager) UnregisterConn(clientIP, proxyID string, conn net.Conn) {
 	}
 	if p := m.proxies[proxyID]; registered && p != nil && p.ActiveConns > 0 {
 		p.ActiveConns--
-		if p.Status == ProxyDraining && p.ActiveConns == 0 {
+		if p.ActiveConns == 0 && p.Source == ProxySourceAPI && !m.proxyHasActiveLeaseLocked(p.ID) {
+			deleteDynamic = p.ID
+			delete(m.proxies, p.ID)
+			m.proxyOrder = removeIP(m.proxyOrder, p.ID)
+		} else if p.Status == ProxyDraining && p.ActiveConns == 0 {
 			p.ClientIP = ""
 			p.DrainingFor = ""
 			if p.Disabled {
@@ -364,6 +447,9 @@ func (m *Manager) UnregisterConn(clientIP, proxyID string, conn net.Conn) {
 		}
 	}
 	m.mu.Unlock()
+	if deleteDynamic != "" {
+		_ = m.db.DeleteProxy(context.Background(), deleteDynamic)
+	}
 	if wakeQueue {
 		m.processQueueAsync()
 	}
@@ -449,6 +535,7 @@ func (m *Manager) AddProxy(ctx context.Context, in ProxyInput) (*Proxy, error) {
 		Password: in.Password,
 		Status:   status,
 		Disabled: in.Disabled,
+		Source:   ProxySourcePool,
 	}
 	if err := m.db.UpsertProxy(ctx, store.Proxy{ID: in.ID, Address: in.Address, Username: in.Username, Password: in.Password, Disabled: in.Disabled}); err != nil {
 		m.mu.Unlock()
@@ -1465,6 +1552,15 @@ func (m *Manager) releaseLocked(ctx context.Context, clientIP string, closeConns
 		}
 	}
 	_ = m.db.DeleteLease(ctx, clientIP)
+	for _, id := range append([]string(nil), m.proxyOrder...) {
+		p := m.proxies[id]
+		if p == nil || p.Source != ProxySourceAPI || p.ActiveConns > 0 || m.proxyHasActiveLeaseLocked(id) {
+			continue
+		}
+		delete(m.proxies, id)
+		m.proxyOrder = removeIP(m.proxyOrder, id)
+		_ = m.db.DeleteProxy(ctx, id)
+	}
 	m.db.AddEvent(ctx, clientIP, l.ProxyID, "released", "")
 	if closeConns {
 		toClose := m.connectionSnapshotLocked(clientIP)
@@ -1510,7 +1606,7 @@ func (m *Manager) releaseProxyBindingLocked(p *Proxy, clientIP string) {
 func (m *Manager) takeIdleProxyLocked() *Proxy {
 	for _, id := range m.proxyOrder {
 		p := m.proxies[id]
-		if p != nil && p.Status == ProxyIdle && !p.Disabled && !m.proxyHasActiveLeaseLocked(p.ID) {
+		if p != nil && p.Source != ProxySourceAPI && p.Status == ProxyIdle && !p.Disabled && !m.proxyHasActiveLeaseLocked(p.ID) {
 			return p
 		}
 	}
@@ -1556,11 +1652,14 @@ func (m *Manager) clientViewsLocked() []ClientView {
 	for ip, l := range m.leases {
 		seen[ip] = true
 		view := ClientView{
-			ClientIP:  ip,
-			Status:    l.Status,
-			ProxyID:   l.ProxyID,
-			ExpiresAt: l.ExpiresAt,
-			Queued:    m.inQueueLocked(m.pendingRefs, ip),
+			ClientIP:        ip,
+			Status:          l.Status,
+			ProxyID:         l.ProxyID,
+			ExpiresAt:       l.ExpiresAt,
+			Queued:          m.inQueueLocked(m.pendingRefs, ip),
+			Mode:            l.Mode,
+			Country:         l.Country,
+			DurationMinutes: l.DurationMinutes,
 		}
 		if view.Queued {
 			view.Status = LeasePending
@@ -1749,14 +1848,24 @@ func (m *Manager) UpdateFrontProxy(next config.FrontProxy, persist func() error)
 			}
 		}
 	}
+	m.proxyAPIMu.Lock()
+	proxyAPIClient, err := providerapi.New(m.proxyAPIConfig, next)
+	if err != nil {
+		m.proxyAPIMu.Unlock()
+		m.mu.Unlock()
+		return err
+	}
 	if err := persist(); err != nil {
+		m.proxyAPIMu.Unlock()
 		m.mu.Unlock()
 		return err
 	}
 	m.connectorMu.Lock()
 	m.connector = candidate
 	m.connectorMu.Unlock()
+	m.proxyAPIClient = proxyAPIClient
 	m.cfg.FrontProxy = next
+	m.proxyAPIMu.Unlock()
 	m.queueBackoffUntil = time.Time{}
 	m.cancelQueueRetryLocked()
 	m.mu.Unlock()

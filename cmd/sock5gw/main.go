@@ -58,7 +58,7 @@ func main() {
 	}()
 
 	gw := gateway.New(cfg.Gateway, cfg.DNS, mgr, router)
-	runtimeCfg := manager.NewRuntimeConfig(*configPath, cfg, gw.SetRouter, mgr.UpdateFrontProxy)
+	runtimeCfg := manager.NewRuntimeConfig(*configPath, cfg, gw.SetRouter, mgr.UpdateFrontProxy, mgr.UpdateProxyAPI)
 	api := &http.Server{
 		Addr:              cfg.API.Listen,
 		Handler:           manager.NewAPI(mgr, cfg.API, runtimeCfg),

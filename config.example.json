@@ -23,6 +23,12 @@
     "password": "",
     "fail_open": false
   },
+  "proxy_api": {
+    "enabled": false,
+    "url": "https://white.1024proxy.com/white/api?region=Rand&num=1&time=10&format=1&type=json",
+    "country_param": "region",
+    "duration_param": "time"
+  },
   "dns": {
     "listen": "0.0.0.0:5353",
     "fake_ip_cidr": "198.18.0.0/15",

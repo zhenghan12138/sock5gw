@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"sock5gw/internal/config"
@@ -13,14 +14,17 @@ import (
 )
 
 type applyFrontProxyFunc func(config.FrontProxy, func() error) error
+type applyProxyAPIFunc func(config.ProxyAPI, func() error) error
 
 type RuntimeConfig struct {
 	mu              sync.RWMutex
 	path            string
 	routing         config.Routing
 	frontProxy      config.FrontProxy
+	proxyAPI        config.ProxyAPI
 	applyRouting    func(*routing.Matcher)
 	applyFrontProxy applyFrontProxyFunc
+	applyProxyAPI   applyProxyAPIFunc
 }
 
 func NewRuntimeConfig(
@@ -28,14 +32,58 @@ func NewRuntimeConfig(
 	cfg *config.Config,
 	applyRouting func(*routing.Matcher),
 	applyFrontProxy applyFrontProxyFunc,
+	proxyAPIFunc ...applyProxyAPIFunc,
 ) *RuntimeConfig {
+	var applyProxyAPI applyProxyAPIFunc
+	if len(proxyAPIFunc) > 0 {
+		applyProxyAPI = proxyAPIFunc[0]
+	}
 	return &RuntimeConfig{
 		path:            path,
 		routing:         cfg.Routing,
 		frontProxy:      cfg.FrontProxy,
+		proxyAPI:        cfg.ProxyAPI,
 		applyRouting:    applyRouting,
 		applyFrontProxy: applyFrontProxy,
+		applyProxyAPI:   applyProxyAPI,
 	}
+}
+
+func (c *RuntimeConfig) ProxyAPI() config.ProxyAPI {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.proxyAPI
+}
+
+func (c *RuntimeConfig) UpdateProxyAPI(next config.ProxyAPI) error {
+	if c == nil {
+		return errors.New("runtime config is unavailable")
+	}
+	if c.applyProxyAPI == nil {
+		return errors.New("proxy API runtime update is unavailable")
+	}
+	next.URL = strings.TrimSpace(next.URL)
+	next.CountryParam = strings.TrimSpace(next.CountryParam)
+	next.DurationParam = strings.TrimSpace(next.DurationParam)
+	if next.CountryParam == "" {
+		next.CountryParam = "region"
+	}
+	if next.DurationParam == "" {
+		next.DurationParam = "time"
+	}
+	if err := config.ValidateProxyAPI(next); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	err := c.applyProxyAPI(next, func() error {
+		return c.writeSection("proxy_api", next)
+	})
+	if err != nil {
+		return err
+	}
+	c.proxyAPI = next
+	return nil
 }
 
 func (c *RuntimeConfig) Routing() config.Routing {
